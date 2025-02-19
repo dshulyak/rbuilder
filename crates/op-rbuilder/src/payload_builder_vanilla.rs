@@ -861,15 +861,13 @@ where
     /// Executes the given best transactions and updates the execution info.
     ///
     /// Returns `Ok(Some(())` if the job was cancelled.
-    pub fn execute_best_transactions<DB>(
+    pub fn execute_best_transactions(
         &self,
         info: &mut ExecutionInfo,
-        db: &mut State<DB>,
+        db: &mut State<impl Database<Error = ProviderError>>,
         mut best_txs: impl PayloadTransactions<Transaction = EvmConfig::Transaction>,
         block_gas_limit: u64,
     ) -> Result<Option<()>, PayloadBuilderError>
-    where
-        DB: Database<Error = ProviderError>,
     {
         let execute_txs_start_time = Instant::now();
         let mut num_txs_considered = 0;

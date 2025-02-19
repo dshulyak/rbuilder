@@ -22,6 +22,7 @@ mod metrics;
 mod monitoring;
 pub mod payload_builder;
 mod payload_builder_vanilla;
+mod tx_executor;
 #[cfg(test)]
 mod tester;
 mod tx_signer;

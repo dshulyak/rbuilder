@@ -720,7 +720,7 @@ where
             self.initialized_block_env.clone(),
             TxEnv::default(),
         );
-        let mut evm = self.evm_config.evm_with_env(&mut *db, env);
+        let mut evm = self.evm_config.evm_with_env(db, env);
 
         for sequencer_tx in &self.attributes().transactions {
             // A sequencer's block should never contain blob transactions.
@@ -822,15 +822,13 @@ where
     /// Executes the given best transactions and updates the execution info.
     ///
     /// Returns `Ok(Some(())` if the job was cancelled.
-    pub fn execute_best_transactions<DB>(
+    pub fn execute_best_transactions(
         &self,
         info: &mut ExecutionInfo,
-        db: &mut State<DB>,
+        db: &mut State<impl Database<Error = ProviderError>>,
         mut best_txs: impl PayloadTransactions<Transaction = EvmConfig::Transaction>,
         batch_gas_limit: u64,
     ) -> Result<Option<()>, PayloadBuilderError>
-    where
-        DB: Database<Error = ProviderError>,
     {
         let base_fee = self.base_fee();
 
@@ -839,7 +837,7 @@ where
             self.initialized_block_env.clone(),
             TxEnv::default(),
         );
-        let mut evm = self.evm_config.evm_with_env(&mut *db, env);
+        let mut evm = self.evm_config.evm_with_env(db, env);
 
         while let Some(tx) = best_txs.next(()) {
             // check in info if the txn has been executed already

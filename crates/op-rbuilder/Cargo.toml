@@ -89,7 +89,7 @@ tikv-jemallocator = { version = "0.6", optional = true }
 reth-discv4.workspace = true
 
 [features]
-default = ["jemalloc"]
+default = ["jemalloc", "optimism"]
 
 jemalloc = [
 	"dep:tikv-jemallocator",
