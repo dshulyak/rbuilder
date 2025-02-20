@@ -4,18 +4,17 @@ use reth_transaction_pool::PoolTransaction;
 use std::{fmt::Display, sync::Arc, time::Instant};
 
 use crate::generator::BuildArguments;
+use crate::tx_executor::ExecutorEnv;
 use crate::{
     generator::{BlockCell, PayloadBuilder},
     metrics::OpRBuilderMetrics,
     tx_signer::Signer,
 };
-use alloy_consensus::{
-    Eip658Value, Header, Transaction, TxEip1559, Typed2718, EMPTY_OMMER_ROOT_HASH,
-};
+use alloy_consensus::{Header, Transaction, TxEip1559, Typed2718, EMPTY_OMMER_ROOT_HASH};
 use alloy_eips::merge::BEACON_NONCE;
 use alloy_primitives::{Address, Bytes, TxKind, B256, U256};
 use alloy_rpc_types_engine::PayloadId;
-use op_alloy_consensus::{OpDepositReceipt, OpTxType, OpTypedTransaction};
+use op_alloy_consensus::OpTypedTransaction;
 use reth_basic_payload_builder::*;
 use reth_chain_state::ExecutedBlock;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
@@ -44,10 +43,7 @@ use reth_transaction_pool::pool::BestPayloadTransactions;
 use reth_transaction_pool::{BestTransactionsAttributes, TransactionPool};
 use revm::{
     db::{states::bundle_state::BundleRetention, State},
-    primitives::{
-        BlockEnv, CfgEnvWithHandlerCfg, EVMError, EnvWithHandlerCfg, InvalidTransaction,
-        ResultAndState, TxEnv,
-    },
+    primitives::{BlockEnv, CfgEnvWithHandlerCfg},
     Database, DatabaseCommit,
 };
 use tokio_util::sync::CancellationToken;
@@ -166,6 +162,10 @@ where
         } = args;
 
         let ctx = OpPayloadBuilderCtx {
+            executor_env: ExecutorEnv::new(
+                cfg_env_with_handler_cfg.clone(),
+                self.evm_config.clone(),
+            ),
             evm_config: self.evm_config.clone(),
             chain_spec: client.chain_spec(),
             config,
@@ -541,6 +541,8 @@ impl ExecutionInfo {
 /// Container type that holds all necessities to build a new payload.
 #[derive(Debug)]
 pub struct OpPayloadBuilderCtx<EvmConfig> {
+    /// The executor environment that holds the EVM configuration and settings
+    pub executor_env: ExecutorEnv<EvmConfig>,
     /// The type that knows how to perform system calls and configure the evm.
     pub evm_config: EvmConfig,
     /// The chainspec
@@ -753,13 +755,9 @@ where
         DB: Database<Error = ProviderError>,
     {
         let mut info = ExecutionInfo::with_capacity(self.attributes().transactions.len());
-
-        let env = EnvWithHandlerCfg::new_with_cfg_env(
-            self.initialized_cfg.clone(),
-            self.initialized_block_env.clone(),
-            TxEnv::default(),
-        );
-        let mut evm = self.evm_config.evm_with_env(&mut *db, env);
+        let mut executor = self
+            .executor_env
+            .executor(self.initialized_block_env.clone(), db);
 
         for sequencer_tx in &self.attributes().transactions {
             // A sequencer's block should never contain blob transactions.
@@ -781,78 +779,31 @@ where
                     PayloadBuilderError::other(OpPayloadBuilderError::TransactionEcRecoverFailed)
                 })?;
 
-            // Cache the depositor account prior to the state transition for the deposit nonce.
-            //
-            // Note that this *only* needs to be done post-regolith hardfork, as deposit nonces
-            // were not introduced in Bedrock. In addition, regular transactions don't have deposit
-            // nonces, so we don't need to touch the DB for those.
-            let depositor = (self.is_regolith_active() && sequencer_tx.is_deposit())
-                .then(|| {
-                    evm.db_mut()
-                        .load_cache_account(sequencer_tx.signer())
-                        .map(|acc| acc.account_info().unwrap_or_default())
-                })
-                .transpose()
-                .map_err(|_| {
-                    PayloadBuilderError::other(OpPayloadBuilderError::AccountLoadFailed(
-                        sequencer_tx.signer(),
-                    ))
-                })?;
-
-            *evm.tx_mut() = self
-                .evm_config
-                .tx_env(sequencer_tx.tx(), sequencer_tx.signer());
-
-            let ResultAndState { result, state } = match evm.transact() {
-                Ok(res) => res,
-                Err(err) => {
-                    match err {
-                        EVMError::Transaction(err) => {
-                            trace!(target: "payload_builder", %err, ?sequencer_tx, "Error in sequencer transaction, skipping.");
-                            continue;
-                        }
-                        err => {
-                            // this is an error that we should treat as fatal for this attempt
-                            return Err(PayloadBuilderError::EvmExecutionError(err));
-                        }
-                    }
+            match executor.execute(&sequencer_tx) {
+                Ok((uncommitted, executed)) => {
+                    uncommitted.commit();
+                    // add gas used by the transaction to cumulative gas used, before creating the receipt
+                    info.cumulative_gas_used += executed.gas_used();
+                    // Push transaction changeset and calculate header bloom filter for receipt.
+                    info.receipts.push(executed.receipt());
+                    // append sender and transaction to the respective lists
+                    info.executed_senders.push(sequencer_tx.signer());
+                    info.executed_transactions.push(sequencer_tx.into_tx());
                 }
-            };
-
-            // commit changes
-            evm.db_mut().commit(state);
-
-            let gas_used = result.gas_used();
-
-            // add gas used by the transaction to cumulative gas used, before creating the receipt
-            info.cumulative_gas_used += gas_used;
-
-            let receipt = alloy_consensus::Receipt {
-                status: Eip658Value::Eip658(result.is_success()),
-                cumulative_gas_used: info.cumulative_gas_used,
-                logs: result.into_logs().into_iter().collect(),
-            };
-
-            // Push transaction changeset and calculate header bloom filter for receipt.
-            info.receipts.push(match sequencer_tx.tx_type() {
-                OpTxType::Legacy => OpReceipt::Legacy(receipt),
-                OpTxType::Eip2930 => OpReceipt::Eip2930(receipt),
-                OpTxType::Eip1559 => OpReceipt::Eip1559(receipt),
-                OpTxType::Eip7702 => OpReceipt::Eip7702(receipt),
-                OpTxType::Deposit => OpReceipt::Deposit(OpDepositReceipt {
-                    inner: receipt,
-                    deposit_nonce: depositor.map(|account| account.nonce),
-                    // The deposit receipt version was introduced in Canyon to indicate an update to
-                    // how receipt hashes should be computed when set. The state
-                    // transition process ensures this is only set for
-                    // post-Canyon deposit transactions.
-                    deposit_receipt_version: self.is_canyon_active().then_some(1),
-                }),
-            });
-
-            // append sender and transaction to the respective lists
-            info.executed_senders.push(sequencer_tx.signer());
-            info.executed_transactions.push(sequencer_tx.into_tx());
+                Err(err) => {
+                    // match err {
+                    //     EVMError::Transaction(err) => {
+                    //         trace!(target: "payload_builder", %err, ?sequencer_tx, "Error in sequencer transaction, skipping.");
+                    //         continue;
+                    //     }
+                    //     err => {
+                    //         // this is an error that we should treat as fatal for this attempt
+                    //         return Err(PayloadBuilderError::EvmExecutionError(err));
+                    //     }
+                    // }
+                    todo!();
+                }
+            }
         }
 
         Ok(info)
@@ -867,8 +818,7 @@ where
         db: &mut State<impl Database<Error = ProviderError>>,
         mut best_txs: impl PayloadTransactions<Transaction = EvmConfig::Transaction>,
         block_gas_limit: u64,
-    ) -> Result<Option<()>, PayloadBuilderError>
-    {
+    ) -> Result<Option<()>, PayloadBuilderError> {
         let execute_txs_start_time = Instant::now();
         let mut num_txs_considered = 0;
         let mut num_txs_simulated = 0;
@@ -876,12 +826,9 @@ where
         let mut num_txs_simulated_fail = 0;
         let base_fee = self.base_fee();
 
-        let env = EnvWithHandlerCfg::new_with_cfg_env(
-            self.initialized_cfg.clone(),
-            self.initialized_block_env.clone(),
-            TxEnv::default(),
-        );
-        let mut evm = self.evm_config.evm_with_env(&mut *db, env);
+        let mut executor = self
+            .executor_env
+            .executor(self.initialized_block_env.clone(), db);
 
         while let Some(tx) = best_txs.next(()) {
             num_txs_considered += 1;
@@ -905,93 +852,69 @@ where
                 return Ok(Some(()));
             }
 
-            // Configure the environment for the tx.
-            *evm.tx_mut() = self.evm_config.tx_env(tx.tx(), tx.signer());
-
             let tx_simulation_start_time = Instant::now();
 
-            let ResultAndState { result, state } = match evm.transact() {
-                Ok(res) => res,
-                Err(err) => {
-                    match err {
-                        EVMError::Transaction(err) => {
-                            if matches!(err, InvalidTransaction::NonceTooLow { .. }) {
-                                // if the nonce is too low, we can skip this transaction
-                                trace!(target: "payload_builder", %err, ?tx, "skipping nonce too low transaction");
-                            } else {
-                                // if the transaction is invalid, we can skip it and all of its
-                                // descendants
-                                trace!(target: "payload_builder", %err, ?tx, "skipping invalid transaction and its descendants");
-                                best_txs.mark_invalid(tx.signer(), tx.nonce());
-                            }
-
-                            continue;
-                        }
-                        err => {
-                            // this is an error that we should treat as fatal for this attempt
-                            return Err(PayloadBuilderError::EvmExecutionError(err));
-                        }
+            match executor.execute(&tx) {
+                Ok((uncommitted, executed)) => {
+                    self.metrics
+                        .tx_simulation_duration
+                        .record(tx_simulation_start_time.elapsed());
+                    self.metrics.tx_byte_size.record(tx.tx().size() as f64);
+                    num_txs_simulated += 1;
+                    if executed.is_success() {
+                        num_txs_simulated_success += 1;
+                    } else {
+                        num_txs_simulated_fail += 1;
                     }
+                    self.metrics
+                        .payload_num_tx_simulated
+                        .record(num_txs_simulated as f64);
+                    self.metrics
+                        .payload_num_tx_simulated_success
+                        .record(num_txs_simulated_success as f64);
+                    self.metrics
+                        .payload_num_tx_simulated_fail
+                        .record(num_txs_simulated_fail as f64);
+
+                    uncommitted.commit();
+
+                    // add gas used by the transaction to cumulative gas used, before creating the
+                    // receipt
+                    info.cumulative_gas_used += executed.gas_used();
+                    // update add to total fees
+                    let miner_fee = tx
+                        .effective_tip_per_gas(base_fee)
+                        .expect("fee is always valid; execution succeeded");
+                    info.total_fees += U256::from(miner_fee) * U256::from(executed.gas_used());
+                    // Push transaction changeset and calculate header bloom filter for receipt.
+                    info.receipts.push(executed.receipt());
+                    // append sender and transaction to the respective lists
+                    info.executed_senders.push(tx.signer());
+                    info.executed_transactions.push(tx.into_tx());
+                }
+                Err(err) => {
+                    // match err {
+                    //     EVMError::Transaction(err) => {
+                    //         if matches!(err, InvalidTransaction::NonceTooLow { .. }) {
+                    //             // if the nonce is too low, we can skip this transaction
+                    //             trace!(target: "payload_builder", %err, ?tx, "skipping nonce too low transaction");
+                    //         } else {
+                    //             // if the transaction is invalid, we can skip it and all of its
+                    //             // descendants
+                    //             trace!(target: "payload_builder", %err, ?tx, "skipping invalid transaction and its descendants");
+                    //             best_txs.mark_invalid(tx.signer(), tx.nonce());
+                    //         }
+
+                    //         continue;
+                    //     }
+                    //     err => {
+                    //         // this is an error that we should treat as fatal for this attempt
+                    //         return Err(PayloadBuilderError::EvmExecutionError(err));
+                    //     }
+                    // }
+                    todo!();
                 }
             };
-
-            self.metrics
-                .tx_simulation_duration
-                .record(tx_simulation_start_time.elapsed());
-            self.metrics.tx_byte_size.record(tx.tx().size() as f64);
-            num_txs_simulated += 1;
-            if result.is_success() {
-                num_txs_simulated_success += 1;
-            } else {
-                num_txs_simulated_fail += 1;
-            }
-            self.metrics
-                .payload_num_tx_simulated
-                .record(num_txs_simulated as f64);
-            self.metrics
-                .payload_num_tx_simulated_success
-                .record(num_txs_simulated_success as f64);
-            self.metrics
-                .payload_num_tx_simulated_fail
-                .record(num_txs_simulated_fail as f64);
-
-            // commit changes
-            evm.db_mut().commit(state);
-
-            let gas_used = result.gas_used();
-
-            // add gas used by the transaction to cumulative gas used, before creating the
-            // receipt
-            info.cumulative_gas_used += gas_used;
-
-            let receipt = alloy_consensus::Receipt {
-                status: Eip658Value::Eip658(result.is_success()),
-                cumulative_gas_used: info.cumulative_gas_used,
-                logs: result.into_logs().into_iter().collect(),
-            };
-
-            // Push transaction changeset and calculate header bloom filter for receipt.
-            info.receipts.push(match tx.tx_type() {
-                OpTxType::Legacy => OpReceipt::Legacy(receipt),
-                OpTxType::Eip2930 => OpReceipt::Eip2930(receipt),
-                OpTxType::Eip1559 => OpReceipt::Eip1559(receipt),
-                OpTxType::Eip7702 => OpReceipt::Eip7702(receipt),
-                OpTxType::Deposit => OpReceipt::Deposit(OpDepositReceipt {
-                    inner: receipt,
-                    deposit_nonce: None,
-                    deposit_receipt_version: None,
-                }),
-            });
-
-            // update add to total fees
-            let miner_fee = tx
-                .effective_tip_per_gas(base_fee)
-                .expect("fee is always valid; execution succeeded");
-            info.total_fees += U256::from(miner_fee) * U256::from(gas_used);
-
-            // append sender and transaction to the respective lists
-            info.executed_senders.push(tx.signer());
-            info.executed_transactions.push(tx.into_tx());
         }
 
         self.metrics
@@ -1044,37 +967,22 @@ where
                 // Sign the transaction
                 let builder_tx = signer.sign_tx(tx).map_err(PayloadBuilderError::other)?;
 
-                let env = EnvWithHandlerCfg::new_with_cfg_env(
-                    self.initialized_cfg.clone(),
-                    self.initialized_block_env.clone(),
-                    TxEnv::default(),
-                );
-                let mut evm = self.evm_config.evm_with_env(&mut *db, env);
-                *evm.tx_mut() = self.evm_config.tx_env(builder_tx.tx(), builder_tx.signer());
+                let mut executor = self
+                    .executor_env
+                    .executor(self.initialized_block_env.clone(), db);
 
-                let ResultAndState { result, state } = evm
-                    .transact()
-                    .map_err(PayloadBuilderError::EvmExecutionError)?;
+                let (uncommitted, executed) = executor.execute(&builder_tx).expect("todo errors");
+                // .map_err(PayloadBuilderError::EvmExecutionError)?;
 
+                uncommitted.commit();
                 // Release the db reference by dropping evm
-                drop(evm);
-                // Commit changes
-                db.commit(state);
-
-                let gas_used = result.gas_used();
+                // NOTE(dshulyak) why it was necessary?
+                // drop(executor);
 
                 // Add gas used by the transaction to cumulative gas used, before creating the receipt
-                info.cumulative_gas_used += gas_used;
-
-                let receipt = alloy_consensus::Receipt {
-                    status: Eip658Value::Eip658(result.is_success()),
-                    cumulative_gas_used: info.cumulative_gas_used,
-                    logs: result.into_logs().into_iter().collect(),
-                };
-
+                info.cumulative_gas_used += executed.gas_used();
                 // Push transaction changeset and calculate header bloom filter for receipt
-                info.receipts.push(OpReceipt::Eip1559(receipt));
-
+                info.receipts.push(executed.receipt());
                 // Append sender and transaction to the respective lists
                 info.executed_senders.push(builder_tx.signer());
                 info.executed_transactions.push(builder_tx.into_tx());
