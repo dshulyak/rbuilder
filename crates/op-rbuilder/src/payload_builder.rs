@@ -1,7 +1,7 @@
 use std::{fmt::Display, sync::Arc, sync::Mutex};
 
 use crate::generator::{BlockCell, BuildArguments, PayloadBuilder};
-use crate::tx_executor::ExecutorEnv;
+use crate::tx_executor::{ExecutorEnv, TxExecutionInfo};
 use alloy_consensus::{Header, Transaction, Typed2718, EMPTY_OMMER_ROOT_HASH};
 use alloy_eips::merge::BEACON_NONCE;
 use alloy_primitives::{Address, Bytes, B256, U256};
@@ -529,19 +529,6 @@ impl ExecutionInfo {
     }
 }
 
-pub struct TxExecutionInfo {
-    /// The transaction that was executed.
-    pub tx: OpTransactionSigned,
-    /// The sender of the transaction.
-    pub sender: Address,
-    /// The receipt of the transaction.
-    pub receipt: OpReceipt,
-    /// The gas used by the transaction.
-    pub gas_used: u64,
-    /// The fee paid by the transaction.
-    pub fee: U256,
-}
-
 /// Container type that holds all necessities to build a new payload.
 #[derive(Debug)]
 pub struct OpPayloadBuilderCtx<EvmConfig> {
@@ -741,7 +728,7 @@ where
 
         let mut executor = self
             .executor_env
-            .executor(self.initialized_block_env.clone(), db);
+            .executor(self.initialized_block_env.clone(), db, 0);
 
         for sequencer_tx in &self.attributes().transactions {
             // A sequencer's block should never contain blob transactions.
@@ -755,7 +742,7 @@ where
             // purely for the purposes of utilizing the `evm_config.tx_env`` function.
             // Deposit transactions do not have signatures, so if the tx is a deposit, this
             // will just pull in its `from` address.
-            let sequencer_tx = sequencer_tx
+            let tx = sequencer_tx
                 .value()
                 .clone()
                 .try_into_ecrecovered()
@@ -763,16 +750,10 @@ where
                     PayloadBuilderError::other(OpPayloadBuilderError::TransactionEcRecoverFailed)
                 })?;
 
-            match executor.execute(&sequencer_tx) {
+            match executor.execute(tx) {
                 Ok((uncommitted, executed)) => {
                     uncommitted.commit();
-                    // add gas used by the transaction to cumulative gas used, before creating the receipt
-                    info.cumulative_gas_used += executed.gas_used();
-                    // Push transaction changeset and calculate header bloom filter for receipt.
-                    info.receipts.push(executed.receipt());
-                    // append sender and transaction to the respective lists
-                    info.executed_senders.push(sequencer_tx.signer());
-                    info.executed_transactions.push(sequencer_tx.into_tx());
+                    info.add(executed.into());
                 }
                 Err(err) => {
                     // match err {
@@ -802,10 +783,9 @@ where
         mut best_txs: impl PayloadTransactions<Transaction = EvmConfig::Transaction>,
         batch_gas_limit: u64,
     ) -> Result<Option<()>, PayloadBuilderError> {
-        let base_fee = self.base_fee();
         let mut executor = self
             .executor_env
-            .executor(self.initialized_block_env.clone(), db);
+            .executor(self.initialized_block_env.clone(), db, self.base_fee());
 
         while let Some(tx) = best_txs.next(()) {
             // check in info if the txn has been executed already
@@ -833,30 +813,23 @@ where
                 return Ok(Some(()));
             }
 
-            match executor.execute(&tx) {
+            match executor.execute(tx) {
                 Ok((uncommitted, executed)) => {
                     uncommitted.commit();
-                    let miner_fee = tx
-                        .effective_tip_per_gas(base_fee)
-                        .expect("fee is always valid; execution succeeded");
-                    info.total_fees += U256::from(miner_fee) * U256::from(executed.gas_used());
-                    info.cumulative_gas_used += executed.gas_used();
-                    info.executed_senders.push(tx.signer());
-                    info.receipts.push(executed.receipt());
-                    info.executed_transactions.push(tx.into_tx());
+                    info.add(executed.into());
                 }
                 Err(err) => {
-                    if let Some(invalid) = err.downcast_ref::<InvalidTransaction>() {
-                        match invalid {
-                            InvalidTransaction::NonceTooLow { .. } => {
-                                trace!(target: "payload_builder", %invalid, ?tx, "skipping nonce too low transaction");
-                            }
-                            _ => {
-                                trace!(target: "payload_builder", %invalid, ?tx, "skipping invalid transaction and its descendants");
-                                best_txs.mark_invalid(tx.signer(), tx.nonce());
-                            }
-                        }
-                    }
+                    // if let Some(invalid) = err.downcast_ref::<InvalidTransaction>() {
+                    //     match invalid {
+                    //         InvalidTransaction::NonceTooLow { .. } => {
+                    //             trace!(target: "payload_builder", %invalid, ?tx, "skipping nonce too low transaction");
+                    //         }
+                    //         _ => {
+                    //             trace!(target: "payload_builder", %invalid, ?tx, "skipping invalid transaction and its descendants");
+                    //             best_txs.mark_invalid(tx.signer(), tx.nonce());
+                    //         }
+                    //     }
+                    // }
                     // return Err(PayloadBuilderError::EvmExecutionError(EVMError::Transaction(
                     //     *invalid_tx,
                     // )));

@@ -1,5 +1,7 @@
 use alloy_consensus::Header;
+use alloy_consensus::Transaction;
 use alloy_consensus::{transaction::Recovered, Eip658Value};
+use alloy_primitives::{Address, U256};
 use op_alloy_consensus::{OpDepositReceipt, OpTxType};
 use reth_evm::ConfigureEvm;
 use reth_optimism_payload_builder::error::OpPayloadBuilderError;
@@ -35,6 +37,7 @@ where
         &'executor self,
         block_env: BlockEnv,
         state: &'executor mut State<DB>,
+        base_fee: u64,
     ) -> Executor<'executor, EvmConfig, DB> {
         let env = EnvWithHandlerCfg::new_with_cfg_env(
             self.initialized_cfg.clone(),
@@ -46,6 +49,7 @@ where
             config: &self.config,
             evm,
             total_gas_used: 0,
+            base_fee,
         }
     }
 }
@@ -58,6 +62,7 @@ pub struct Executor<
     config: &'executor EvmConfig,
     evm: Evm<'executor, EvmConfig::DefaultExternalContext<'executor>, &'executor mut State<DB>>,
     total_gas_used: u64,
+    base_fee: u64,
 }
 
 impl<'executor, EvmConfig, DB> Executor<'executor, EvmConfig, DB>
@@ -67,12 +72,11 @@ where
 {
     pub fn execute<'call>(
         &'call mut self,
-        tx: &'call Recovered<OpTransactionSigned>,
-    ) -> Result<(
-        UncommittedTx<'executor, 'call, EvmConfig, DB>, 
-        ExecutedTxInfo<'call>,
-    ), Box<dyn std::error::Error>>
-    {
+        tx: Recovered<OpTransactionSigned>,
+    ) -> Result<
+        (UncommittedTx<'executor, 'call, EvmConfig, DB>, ExecutedTx),
+        Box<dyn std::error::Error>,
+    > {
         // Cache the depositor account prior to the state transition for the deposit nonce.
         //
         // Note that this *only* needs to be done post-regolith hardfork, as deposit nonces
@@ -96,7 +100,8 @@ where
                 evm: &mut self.evm,
                 state,
             },
-            ExecutedTxInfo {
+            ExecutedTx {
+                base_fee: self.base_fee,
                 total_gas_used: self.total_gas_used,
                 tx,
                 result,
@@ -105,7 +110,6 @@ where
         ))
     }
 }
-
 
 pub struct UncommittedTx<
     'executor,
@@ -127,20 +131,19 @@ where
     DB: Database,
 {
     pub fn commit(self) {
-        self.evm
-            .db_mut()
-            .commit(self.state);
+        self.evm.db_mut().commit(self.state);
     }
 }
 
-pub struct ExecutedTxInfo<'call> {
+pub struct ExecutedTx {
     total_gas_used: u64,
-    tx: &'call Recovered<OpTransactionSigned>,
+    base_fee: u64,
+    tx: Recovered<OpTransactionSigned>,
     account: Option<AccountInfo>,
     result: ExecutionResult,
 }
 
-impl<'call> ExecutedTxInfo<'call> {
+impl ExecutedTx {
     pub fn gas_used(&self) -> u64 {
         self.result.gas_used()
     }
@@ -149,13 +152,18 @@ impl<'call> ExecutedTxInfo<'call> {
         self.result.is_success()
     }
 
-    pub fn receipt(self) -> OpReceipt {
+    pub fn tx(&self) -> &Recovered<OpTransactionSigned> {
+        &self.tx
+    }
+
+    pub fn info(self) -> TxExecutionInfo {
+        let gas_used = self.gas_used();
         let receipt = alloy_consensus::Receipt {
             status: Eip658Value::Eip658(self.is_success()),
             cumulative_gas_used: self.total_gas_used,
             logs: self.result.into_logs(),
         };
-        match self.tx.tx_type() {
+        let receipt = match self.tx.tx_type() {
             OpTxType::Legacy => OpReceipt::Legacy(receipt),
             OpTxType::Eip2930 => OpReceipt::Eip2930(receipt),
             OpTxType::Eip1559 => OpReceipt::Eip1559(receipt),
@@ -165,6 +173,37 @@ impl<'call> ExecutedTxInfo<'call> {
                 deposit_nonce: self.account.map(|account| account.nonce),
                 deposit_receipt_version: None,
             }),
+        };
+        let fee = self
+            .tx
+            .effective_tip_per_gas(self.base_fee)
+            .expect("fee is always valid; execution succeeded");
+        let sender = self.tx.signer();
+        TxExecutionInfo {
+            tx: self.tx.into_tx(),
+            sender,
+            receipt,
+            gas_used: gas_used,
+            fee: U256::from(fee) * U256::from(gas_used),
         }
+    }
+}
+
+pub struct TxExecutionInfo {
+    /// The transaction that was executed.
+    pub tx: OpTransactionSigned,
+    /// The sender of the transaction.
+    pub sender: Address,
+    /// The receipt of the transaction.
+    pub receipt: OpReceipt,
+    /// The gas used by the transaction.
+    pub gas_used: u64,
+    /// The fee paid by the transaction.
+    pub fee: U256,
+}
+
+impl From<ExecutedTx> for TxExecutionInfo {
+    fn from(executed: ExecutedTx) -> Self {
+        executed.info()
     }
 }

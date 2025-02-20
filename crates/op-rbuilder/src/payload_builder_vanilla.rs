@@ -4,7 +4,7 @@ use reth_transaction_pool::PoolTransaction;
 use std::{fmt::Display, sync::Arc, time::Instant};
 
 use crate::generator::BuildArguments;
-use crate::tx_executor::ExecutorEnv;
+use crate::tx_executor::{ExecutorEnv, TxExecutionInfo};
 use crate::{
     generator::{BlockCell, PayloadBuilder},
     metrics::OpRBuilderMetrics,
@@ -536,6 +536,14 @@ impl ExecutionInfo {
             total_fees: U256::ZERO,
         }
     }
+
+    pub fn add(&mut self, info: TxExecutionInfo) {
+        self.executed_transactions.push(info.tx);
+        self.executed_senders.push(info.sender);
+        self.receipts.push(info.receipt);
+        self.cumulative_gas_used += info.gas_used;
+        self.total_fees += info.fee;
+    }
 }
 
 /// Container type that holds all necessities to build a new payload.
@@ -757,7 +765,7 @@ where
         let mut info = ExecutionInfo::with_capacity(self.attributes().transactions.len());
         let mut executor = self
             .executor_env
-            .executor(self.initialized_block_env.clone(), db);
+            .executor(self.initialized_block_env.clone(), db, 0);
 
         for sequencer_tx in &self.attributes().transactions {
             // A sequencer's block should never contain blob transactions.
@@ -779,16 +787,10 @@ where
                     PayloadBuilderError::other(OpPayloadBuilderError::TransactionEcRecoverFailed)
                 })?;
 
-            match executor.execute(&sequencer_tx) {
+            match executor.execute(sequencer_tx) {
                 Ok((uncommitted, executed)) => {
                     uncommitted.commit();
-                    // add gas used by the transaction to cumulative gas used, before creating the receipt
-                    info.cumulative_gas_used += executed.gas_used();
-                    // Push transaction changeset and calculate header bloom filter for receipt.
-                    info.receipts.push(executed.receipt());
-                    // append sender and transaction to the respective lists
-                    info.executed_senders.push(sequencer_tx.signer());
-                    info.executed_transactions.push(sequencer_tx.into_tx());
+                    info.add(executed.into());
                 }
                 Err(err) => {
                     // match err {
@@ -828,7 +830,7 @@ where
 
         let mut executor = self
             .executor_env
-            .executor(self.initialized_block_env.clone(), db);
+            .executor(self.initialized_block_env.clone(), db, base_fee);
 
         while let Some(tx) = best_txs.next(()) {
             num_txs_considered += 1;
@@ -854,12 +856,12 @@ where
 
             let tx_simulation_start_time = Instant::now();
 
-            match executor.execute(&tx) {
+            match executor.execute(tx) {
                 Ok((uncommitted, executed)) => {
                     self.metrics
                         .tx_simulation_duration
                         .record(tx_simulation_start_time.elapsed());
-                    self.metrics.tx_byte_size.record(tx.tx().size() as f64);
+                    self.metrics.tx_byte_size.record(executed.tx().size() as f64);
                     num_txs_simulated += 1;
                     if executed.is_success() {
                         num_txs_simulated_success += 1;
@@ -877,20 +879,7 @@ where
                         .record(num_txs_simulated_fail as f64);
 
                     uncommitted.commit();
-
-                    // add gas used by the transaction to cumulative gas used, before creating the
-                    // receipt
-                    info.cumulative_gas_used += executed.gas_used();
-                    // update add to total fees
-                    let miner_fee = tx
-                        .effective_tip_per_gas(base_fee)
-                        .expect("fee is always valid; execution succeeded");
-                    info.total_fees += U256::from(miner_fee) * U256::from(executed.gas_used());
-                    // Push transaction changeset and calculate header bloom filter for receipt.
-                    info.receipts.push(executed.receipt());
-                    // append sender and transaction to the respective lists
-                    info.executed_senders.push(tx.signer());
-                    info.executed_transactions.push(tx.into_tx());
+                    info.add(executed.into());
                 }
                 Err(err) => {
                     // match err {
@@ -967,25 +956,19 @@ where
                 // Sign the transaction
                 let builder_tx = signer.sign_tx(tx).map_err(PayloadBuilderError::other)?;
 
+                // NOTE(dshulyak) is it intentional that fee from builder tx is not added to the info?
                 let mut executor = self
                     .executor_env
-                    .executor(self.initialized_block_env.clone(), db);
+                    .executor(self.initialized_block_env.clone(), db, 0);
 
-                let (uncommitted, executed) = executor.execute(&builder_tx).expect("todo errors");
+                let (uncommitted, executed) = executor.execute(builder_tx).expect("todo errors");
                 // .map_err(PayloadBuilderError::EvmExecutionError)?;
 
                 uncommitted.commit();
                 // Release the db reference by dropping evm
                 // NOTE(dshulyak) why it was necessary?
                 // drop(executor);
-
-                // Add gas used by the transaction to cumulative gas used, before creating the receipt
-                info.cumulative_gas_used += executed.gas_used();
-                // Push transaction changeset and calculate header bloom filter for receipt
-                info.receipts.push(executed.receipt());
-                // Append sender and transaction to the respective lists
-                info.executed_senders.push(builder_tx.signer());
-                info.executed_transactions.push(builder_tx.into_tx());
+                info.add(executed.into());
                 Ok(())
             })
             .transpose()
