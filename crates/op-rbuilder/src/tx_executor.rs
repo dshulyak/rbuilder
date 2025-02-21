@@ -8,6 +8,7 @@ use reth_optimism_payload_builder::error::OpPayloadBuilderError;
 use reth_optimism_primitives::{OpReceipt, OpTransactionSigned};
 use reth_provider::ProviderError;
 use revm::primitives::AccountInfo;
+use revm::primitives::EVMError;
 use revm::{
     primitives::{
         BlockEnv, CfgEnvWithHandlerCfg, EnvWithHandlerCfg, EvmState, ExecutionResult,
@@ -15,44 +16,6 @@ use revm::{
     },
     Database, DatabaseCommit, Evm, State,
 };
-
-#[derive(Debug)]
-pub struct ExecutorEnv<EvmConfig> {
-    initialized_cfg: CfgEnvWithHandlerCfg,
-    config: EvmConfig,
-}
-
-impl<EvmConfig> ExecutorEnv<EvmConfig>
-where
-    EvmConfig: ConfigureEvm<Header = Header, Transaction = OpTransactionSigned>,
-{
-    pub fn new(initialized_cfg: CfgEnvWithHandlerCfg, config: EvmConfig) -> Self {
-        Self {
-            initialized_cfg,
-            config,
-        }
-    }
-
-    pub fn executor<'executor, DB: Database<Error = ProviderError>>(
-        &'executor self,
-        block_env: BlockEnv,
-        state: &'executor mut State<DB>,
-        base_fee: u64,
-    ) -> Executor<'executor, EvmConfig, DB> {
-        let env = EnvWithHandlerCfg::new_with_cfg_env(
-            self.initialized_cfg.clone(),
-            block_env,
-            TxEnv::default(),
-        );
-        let evm = self.config.evm_with_env(state, env);
-        Executor {
-            config: &self.config,
-            evm,
-            total_gas_used: 0,
-            base_fee,
-        }
-    }
-}
 
 pub struct Executor<
     'executor,
@@ -70,13 +33,28 @@ where
     EvmConfig: ConfigureEvm<Header = Header, Transaction = OpTransactionSigned>,
     DB: Database<Error = ProviderError>,
 {
+    pub fn new<'a>(
+        initialized_cfg: CfgEnvWithHandlerCfg,
+        config: &'a EvmConfig,
+        block_env: BlockEnv,
+        state: &'a mut State<DB>,
+        base_fee: u64,
+    ) -> Executor<'a, EvmConfig, DB> {
+        let env = EnvWithHandlerCfg::new_with_cfg_env(initialized_cfg, block_env, TxEnv::default());
+        let evm = config.evm_with_env(state, env);
+        Executor {
+            config: config,
+            evm,
+            total_gas_used: 0,
+            base_fee,
+        }
+    }
+
     pub fn execute<'call>(
         &'call mut self,
         tx: Recovered<OpTransactionSigned>,
-    ) -> Result<
-        (UncommittedTx<'executor, 'call, EvmConfig, DB>, ExecutedTx),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> Result<(UncommittedTx<'executor, 'call, EvmConfig, DB>, ExecutedTx), EVMError<DB::Error>>
+    {
         // Cache the depositor account prior to the state transition for the deposit nonce.
         //
         // Note that this *only* needs to be done post-regolith hardfork, as deposit nonces
@@ -91,9 +69,10 @@ where
                     .map(|acc| acc.account_info().unwrap_or_default())
             })
             .transpose()
-            .map_err(|_| OpPayloadBuilderError::AccountLoadFailed(tx.signer()))?;
+            .map_err(|_| OpPayloadBuilderError::AccountLoadFailed(tx.signer()))
+            .expect("err");
         *self.evm.tx_mut() = self.config.tx_env(tx.tx(), tx.signer());
-        let ResultAndState { result, state } = self.evm.transact().expect("no error");
+        let ResultAndState { result, state } = self.evm.transact()?;
         self.total_gas_used += result.gas_used();
         Ok((
             UncommittedTx {

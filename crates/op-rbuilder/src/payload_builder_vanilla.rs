@@ -1,10 +1,11 @@
 use alloy_rpc_types_eth::Withdrawals;
 use reth::core::primitives::InMemorySize;
 use reth_transaction_pool::PoolTransaction;
+use std::fmt::Debug;
 use std::{fmt::Display, sync::Arc, time::Instant};
 
 use crate::generator::BuildArguments;
-use crate::tx_executor::{ExecutorEnv, TxExecutionInfo};
+use crate::tx_executor::{Executor, TxExecutionInfo};
 use crate::{
     generator::{BlockCell, PayloadBuilder},
     metrics::OpRBuilderMetrics,
@@ -162,10 +163,6 @@ where
         } = args;
 
         let ctx = OpPayloadBuilderCtx {
-            executor_env: ExecutorEnv::new(
-                cfg_env_with_handler_cfg.clone(),
-                self.evm_config.clone(),
-            ),
             evm_config: self.evm_config.clone(),
             chain_spec: client.chain_spec(),
             config,
@@ -549,8 +546,6 @@ impl ExecutionInfo {
 /// Container type that holds all necessities to build a new payload.
 #[derive(Debug)]
 pub struct OpPayloadBuilderCtx<EvmConfig> {
-    /// The executor environment that holds the EVM configuration and settings
-    pub executor_env: ExecutorEnv<EvmConfig>,
     /// The type that knows how to perform system calls and configure the evm.
     pub evm_config: EvmConfig,
     /// The chainspec
@@ -763,9 +758,13 @@ where
         DB: Database<Error = ProviderError>,
     {
         let mut info = ExecutionInfo::with_capacity(self.attributes().transactions.len());
-        let mut executor = self
-            .executor_env
-            .executor(self.initialized_block_env.clone(), db, 0);
+        let mut executor = Executor::new(
+            self.initialized_cfg.clone(),
+            &self.evm_config,
+            self.initialized_block_env.clone(),
+            db,
+            0,
+        );
 
         for sequencer_tx in &self.attributes().transactions {
             // A sequencer's block should never contain blob transactions.
@@ -828,9 +827,13 @@ where
         let mut num_txs_simulated_fail = 0;
         let base_fee = self.base_fee();
 
-        let mut executor = self
-            .executor_env
-            .executor(self.initialized_block_env.clone(), db, base_fee);
+        let mut executor = Executor::new(
+            self.initialized_cfg.clone(),
+            &self.evm_config,
+            self.initialized_block_env.clone(),
+            db,
+            base_fee,
+        );
 
         while let Some(tx) = best_txs.next(()) {
             num_txs_considered += 1;
@@ -861,7 +864,9 @@ where
                     self.metrics
                         .tx_simulation_duration
                         .record(tx_simulation_start_time.elapsed());
-                    self.metrics.tx_byte_size.record(executed.tx().size() as f64);
+                    self.metrics
+                        .tx_byte_size
+                        .record(executed.tx().size() as f64);
                     num_txs_simulated += 1;
                     if executed.is_success() {
                         num_txs_simulated_success += 1;
@@ -957,9 +962,13 @@ where
                 let builder_tx = signer.sign_tx(tx).map_err(PayloadBuilderError::other)?;
 
                 // NOTE(dshulyak) is it intentional that fee from builder tx is not added to the info?
-                let mut executor = self
-                    .executor_env
-                    .executor(self.initialized_block_env.clone(), db, 0);
+                let mut executor = Executor::new(
+                    self.initialized_cfg.clone(),
+                    &self.evm_config,
+                    self.initialized_block_env.clone(),
+                    db,
+                    0,
+                );
 
                 let (uncommitted, executed) = executor.execute(builder_tx).expect("todo errors");
                 // .map_err(PayloadBuilderError::EvmExecutionError)?;

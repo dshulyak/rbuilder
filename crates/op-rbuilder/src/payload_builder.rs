@@ -1,7 +1,7 @@
 use std::{fmt::Display, sync::Arc, sync::Mutex};
 
 use crate::generator::{BlockCell, BuildArguments, PayloadBuilder};
-use crate::tx_executor::{ExecutorEnv, TxExecutionInfo};
+use crate::tx_executor::{Executor, TxExecutionInfo};
 use alloy_consensus::{Header, Transaction, Typed2718, EMPTY_OMMER_ROOT_HASH};
 use alloy_eips::merge::BEACON_NONCE;
 use alloy_primitives::{Address, Bytes, B256, U256};
@@ -172,10 +172,6 @@ where
         } = args;
 
         let ctx = OpPayloadBuilderCtx {
-            executor_env: ExecutorEnv::new(
-                cfg_env_with_handler_cfg.clone(),
-                self.evm_config.clone(),
-            ),
             evm_config: self.evm_config.clone(),
             chain_spec: client.chain_spec(),
             config,
@@ -532,8 +528,6 @@ impl ExecutionInfo {
 /// Container type that holds all necessities to build a new payload.
 #[derive(Debug)]
 pub struct OpPayloadBuilderCtx<EvmConfig> {
-    /// The executor environment that holds the EVM configuration and settings
-    pub executor_env: ExecutorEnv<EvmConfig>,
     /// The type that knows how to perform system calls and configure the evm.
     pub evm_config: EvmConfig,
     /// The chainspec
@@ -726,9 +720,13 @@ where
     {
         let mut info = ExecutionInfo::with_capacity(self.attributes().transactions.len());
 
-        let mut executor = self
-            .executor_env
-            .executor(self.initialized_block_env.clone(), db, 0);
+        let mut executor = Executor::new(
+            self.initialized_cfg.clone(),
+            &self.evm_config,
+            self.initialized_block_env.clone(),
+            db,
+            0,
+        );
 
         for sequencer_tx in &self.attributes().transactions {
             // A sequencer's block should never contain blob transactions.
@@ -750,25 +748,25 @@ where
                     PayloadBuilderError::other(OpPayloadBuilderError::TransactionEcRecoverFailed)
                 })?;
 
-            match executor.execute(tx) {
-                Ok((uncommitted, executed)) => {
-                    uncommitted.commit();
-                    info.add(executed.into());
-                }
-                Err(err) => {
+            executor.execute(tx).map_or_else(
+                |err| {
                     // match err {
-                    //     EVMError::Transaction(err) => {
-                    //         trace!(target: "payload_builder", %err, ?sequencer_tx, "Error in sequencer transaction, skipping.");
-                    //         continue;
-                    //     }
-                    //     err => {
-                    //         // this is an error that we should treat as fatal for this attempt
-                    //         return Err(PayloadBuilderError::EvmExecutionError(err));
-                    //     }
+                    // EVMError::Transaction(err) => {
+                    //     trace!(target: "payload_builder", %err, ?sequencer_tx, "Error in sequencer transaction, skipping.");
+                    //     continue;
+                    // }
+                    // err => {
+                    //     // this is an error that we should treat as fatal for this attempt
+                    //     return Err(PayloadBuilderError::EvmExecutionError(err));
+                    // }
                     // }
                     todo!();
-                }
-            }
+                },
+                |(uncommitted, executed)| {
+                    uncommitted.commit();
+                    info.add(executed.into());
+                },
+            );
         }
         Ok(info)
     }
@@ -776,16 +774,23 @@ where
     /// Executes the given best transactions and updates the execution info.
     ///
     /// Returns `Ok(Some(())` if the job was cancelled.
-    pub fn execute_best_transactions(
+    pub fn execute_best_transactions<DB>(
         &self,
         info: &mut ExecutionInfo,
-        db: &mut State<impl Database<Error = ProviderError>>,
+        db: &mut State<DB>,
         mut best_txs: impl PayloadTransactions<Transaction = EvmConfig::Transaction>,
         batch_gas_limit: u64,
-    ) -> Result<Option<()>, PayloadBuilderError> {
-        let mut executor = self
-            .executor_env
-            .executor(self.initialized_block_env.clone(), db, self.base_fee());
+    ) -> Result<Option<()>, PayloadBuilderError>
+    where
+        DB: Database<Error = ProviderError>,
+    {
+        let mut executor = Executor::new(
+            self.initialized_cfg.clone(),
+            &self.evm_config,
+            self.initialized_block_env.clone(),
+            db,
+            self.base_fee(),
+        );
 
         while let Some(tx) = best_txs.next(()) {
             // check in info if the txn has been executed already
