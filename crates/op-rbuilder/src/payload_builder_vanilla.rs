@@ -1,28 +1,33 @@
-use alloy_rpc_types_eth::Withdrawals;
-use reth::core::primitives::InMemorySize;
-use reth_transaction_pool::PoolTransaction;
 use std::fmt::Debug;
 use std::{fmt::Display, sync::Arc, time::Instant};
 
 use crate::generator::BuildArguments;
-use crate::tx_executor::{Executor, TxExecutionInfo};
+use crate::tx_executor::{
+    CallExecutor, OpExecutor, PreBlockHashesContractCall, StateExecutor, TxExecutionInfo,
+    TxExecutor,
+};
 use crate::{
     generator::{BlockCell, PayloadBuilder},
     metrics::OpRBuilderMetrics,
     tx_signer::Signer,
 };
+
 use alloy_consensus::{Header, Transaction, TxEip1559, Typed2718, EMPTY_OMMER_ROOT_HASH};
 use alloy_eips::merge::BEACON_NONCE;
 use alloy_primitives::{Address, Bytes, TxKind, B256, U256};
 use alloy_rpc_types_engine::PayloadId;
-use op_alloy_consensus::OpTypedTransaction;
+use alloy_rpc_types_eth::Withdrawals;
+use op_alloy_consensus::{EIP1559ParamError, OpTypedTransaction};
+use reth::core::primitives::InMemorySize;
 use reth_basic_payload_builder::*;
 use reth_chain_state::ExecutedBlock;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
-use reth_evm::{env::EvmEnv, system_calls::SystemCaller, ConfigureEvm, NextBlockEnvAttributes};
+use reth_evm::ConfigureEvmEnv;
+use reth_evm::{env::EvmEnv, NextBlockEnvAttributes};
 use reth_execution_types::ExecutionOutcome;
 use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_consensus::calculate_receipt_root_no_memo_optimism;
+use reth_optimism_evm::OpEvmConfig;
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_payload_builder::{
     error::OpPayloadBuilderError,
@@ -41,10 +46,12 @@ use reth_provider::{
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_transaction_pool::pool::BestPayloadTransactions;
+use reth_transaction_pool::PoolTransaction;
 use reth_transaction_pool::{BestTransactionsAttributes, TransactionPool};
+use revm::primitives::ExecutionResult;
 use revm::{
     db::{states::bundle_state::BundleRetention, State},
-    primitives::{BlockEnv, CfgEnvWithHandlerCfg},
+    primitives::BlockEnv,
     Database, DatabaseCommit,
 };
 use tokio_util::sync::CancellationToken;
@@ -52,9 +59,9 @@ use tracing::{info, trace, warn};
 
 /// Optimism's payload builder
 #[derive(Debug, Clone)]
-pub struct OpPayloadBuilderVanilla<EvmConfig, Txs = ()> {
+pub struct OpPayloadBuilderVanilla<Txs = ()> {
     /// The type responsible for creating the evm.
-    pub evm_config: EvmConfig,
+    pub evm_config: OpEvmConfig,
     /// The builder's signer key to use for an end of block tx
     pub builder_signer: Option<Signer>,
     /// The type responsible for yielding the best transactions for the payload if mempool
@@ -64,9 +71,9 @@ pub struct OpPayloadBuilderVanilla<EvmConfig, Txs = ()> {
     pub metrics: OpRBuilderMetrics,
 }
 
-impl<EvmConfig> OpPayloadBuilderVanilla<EvmConfig> {
+impl OpPayloadBuilderVanilla {
     /// `OpPayloadBuilder` constructor.
-    pub fn new(evm_config: EvmConfig, builder_signer: Option<Signer>) -> Self {
+    pub fn new(evm_config: OpEvmConfig, builder_signer: Option<Signer>) -> Self {
         Self {
             evm_config,
             builder_signer,
@@ -76,11 +83,10 @@ impl<EvmConfig> OpPayloadBuilderVanilla<EvmConfig> {
     }
 }
 
-impl<EvmConfig, Pool, Client> PayloadBuilder<Pool, Client> for OpPayloadBuilderVanilla<EvmConfig>
+impl<Pool, Client> PayloadBuilder<Pool, Client> for OpPayloadBuilderVanilla
 where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec = OpChainSpec>,
-    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = EvmConfig::Transaction>>,
-    EvmConfig: ConfigureEvm<Header = Header, Transaction = OpTransactionSigned>,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = OpTransactionSigned>>,
 {
     type Attributes = OpPayloadBuilderAttributes;
     type BuiltPayload = OpBuiltPayload;
@@ -124,10 +130,7 @@ where
     }
 }
 
-impl<EvmConfig> OpPayloadBuilderVanilla<EvmConfig>
-where
-    EvmConfig: ConfigureEvm<Header = Header, Transaction = OpTransactionSigned>,
-{
+impl OpPayloadBuilderVanilla {
     /// Constructs an Optimism payload from the transactions sent via the
     /// Payload attributes by the sequencer. If the `no_tx_pool` argument is passed in
     /// the payload attributes, the transaction pool will be ignored and the only transactions
@@ -162,11 +165,11 @@ where
             cancel,
         } = args;
 
+        let executor = OpExecutor::new(cfg_env_with_handler_cfg, self.evm_config.clone());
         let ctx = OpPayloadBuilderCtx {
-            evm_config: self.evm_config.clone(),
+            executor,
             chain_spec: client.chain_spec(),
             config,
-            initialized_cfg: cfg_env_with_handler_cfg,
             initialized_block_env: block_env,
             cancel,
             builder_signer: self.builder_signer,
@@ -196,18 +199,15 @@ where
     }
 }
 
-impl<EvmConfig, Txs> OpPayloadBuilderVanilla<EvmConfig, Txs>
-where
-    EvmConfig: ConfigureEvm<Header = Header>,
-{
+impl<Txs> OpPayloadBuilderVanilla<Txs> {
     /// Returns the configured [`EvmEnv`] for the targeted payload
     /// (that has the `parent` as its parent).
     pub fn cfg_and_block_env(
         &self,
         attributes: &OpPayloadBuilderAttributes,
         parent: &Header,
-    ) -> Result<EvmEnv, EvmConfig::Error> {
-        let next_attributes = NextBlockEnvAttributes {
+    ) -> Result<EvmEnv, EIP1559ParamError> {
+        let next_attributes: NextBlockEnvAttributes = NextBlockEnvAttributes {
             timestamp: attributes.timestamp(),
             suggested_fee_recipient: attributes.suggested_fee_recipient(),
             prev_randao: attributes.prev_randao(),
@@ -252,13 +252,17 @@ where
     Txs: PayloadTransactions<Transaction = OpTransactionSigned>,
 {
     /// Executes the payload and returns the outcome.
-    pub fn execute<EvmConfig, DB>(
+    pub fn execute<Executor, DB>(
         self,
         state: &mut State<DB>,
-        ctx: &OpPayloadBuilderCtx<EvmConfig>,
+        ctx: &OpPayloadBuilderCtx<Executor>,
     ) -> Result<BuildOutcomeKind<ExecutedPayload>, PayloadBuilderError>
     where
-        EvmConfig: ConfigureEvm<Header = Header, Transaction = OpTransactionSigned>,
+        Executor: StateExecutor<
+                Transaction = OpTransactionSigned,
+                Receipt = OpReceipt,
+                ExecutionResult = ExecutionResult,
+            > + for<'a> CallExecutor<PreBlockHashesContractCall, Params<'a> = (&'a BlockEnv)>,
         DB: Database<Error = ProviderError>,
     {
         let Self { best } = self;
@@ -286,7 +290,7 @@ where
             .as_bytes()
             .to_vec();
         let builder_tx_gas = ctx.builder_signer().map_or(0, |_| {
-            OpPayloadBuilderCtx::<EvmConfig>::estimate_gas_for_builder_tx(message.clone())
+            OpPayloadBuilderCtx::<Executor>::estimate_gas_for_builder_tx(message.clone())
         });
         let block_gas_limit = ctx.block_gas_limit() - builder_tx_gas;
         if !ctx.attributes().no_tx_pool {
@@ -330,13 +334,17 @@ where
     }
 
     /// Builds the payload on top of the state.
-    pub fn build<EvmConfig, DB, P>(
+    pub fn build<Executor, DB, P>(
         self,
         mut state: State<DB>,
-        ctx: OpPayloadBuilderCtx<EvmConfig>,
+        ctx: OpPayloadBuilderCtx<Executor>,
     ) -> Result<BuildOutcomeKind<OpBuiltPayload>, PayloadBuilderError>
     where
-        EvmConfig: ConfigureEvm<Header = Header, Transaction = OpTransactionSigned>,
+        Executor: StateExecutor<
+                Transaction = OpTransactionSigned,
+                Receipt = OpReceipt,
+                ExecutionResult = ExecutionResult,
+            > + for<'a> CallExecutor<PreBlockHashesContractCall, Params<'a> = (&'a BlockEnv)>,
         DB: Database<Error = ProviderError> + AsRef<P>,
         P: StateRootProvider + HashedPostStateProvider,
     {
@@ -545,15 +553,13 @@ impl ExecutionInfo {
 
 /// Container type that holds all necessities to build a new payload.
 #[derive(Debug)]
-pub struct OpPayloadBuilderCtx<EvmConfig> {
-    /// The type that knows how to perform system calls and configure the evm.
-    pub evm_config: EvmConfig,
+pub struct OpPayloadBuilderCtx<Executor> {
+    /// Transactions and syscalls executor.
+    executor: Executor,
     /// The chainspec
     pub chain_spec: Arc<OpChainSpec>,
     /// How to build the payload.
     pub config: PayloadConfig<OpPayloadBuilderAttributes>,
-    /// Evm Settings
-    pub initialized_cfg: CfgEnvWithHandlerCfg,
     /// Block config
     pub initialized_block_env: BlockEnv,
     /// Marker to check whether the job has been cancelled.
@@ -564,7 +570,7 @@ pub struct OpPayloadBuilderCtx<EvmConfig> {
     pub metrics: OpRBuilderMetrics,
 }
 
-impl<EvmConfig> OpPayloadBuilderCtx<EvmConfig> {
+impl<Executor> OpPayloadBuilderCtx<Executor> {
     /// Returns the parent block the payload will be build on.
     pub fn parent(&self) -> &SealedHeader {
         &self.config.parent_header
@@ -715,9 +721,13 @@ impl<EvmConfig> OpPayloadBuilderCtx<EvmConfig> {
     }
 }
 
-impl<EvmConfig> OpPayloadBuilderCtx<EvmConfig>
+impl<Executor> OpPayloadBuilderCtx<Executor>
 where
-    EvmConfig: ConfigureEvm<Header = Header, Transaction = OpTransactionSigned>,
+    Executor: StateExecutor<
+            Transaction = OpTransactionSigned,
+            Receipt = OpReceipt,
+            ExecutionResult = ExecutionResult,
+        > + for<'a> CallExecutor<PreBlockHashesContractCall, Params<'a> = (&'a BlockEnv)>,
 {
     /// apply eip-4788 pre block contract call
     pub fn apply_pre_beacon_root_contract_call<DB>(
@@ -728,29 +738,29 @@ where
         DB: Database + DatabaseCommit,
         DB::Error: Display,
     {
-        SystemCaller::new(self.evm_config.clone(), self.chain_spec.clone())
-            .pre_block_beacon_root_contract_call(
-                db,
-                &self.initialized_cfg,
-                &self.initialized_block_env,
-                self.attributes()
-                    .payload_attributes
-                    .parent_beacon_block_root,
-            )
-            .map_err(|err| {
-                warn!(target: "payload_builder",
-                    parent_header=%self.parent().hash(),
-                    %err,
-                    "failed to apply beacon root contract call for payload"
-                );
-                PayloadBuilderError::Internal(err.into())
-            })?;
-
+        // SystemCaller::new(self.evm_config.clone(), self.chain_spec.clone())
+        //     .pre_block_beacon_root_contract_call(
+        //         db,
+        //         &self.initialized_cfg,
+        //         &self.initialized_block_env,
+        //         self.attributes()
+        //             .payload_attributes
+        //             .parent_beacon_block_root,
+        //     )
+        //     .map_err(|err| {
+        //         warn!(target: "payload_builder",
+        //             parent_header=%self.parent().hash(),
+        //             %err,
+        //             "failed to apply beacon root contract call for payload"
+        //         );
+        //         PayloadBuilderError::Internal(err.into())
+        //     })?;
+        self.executor.syscall(db, (&self.initialized_block_env));
         Ok(())
     }
 
     /// Executes all sequencer transactions that are included in the payload attributes.
-    pub fn execute_sequencer_transactions<DB>(
+    pub fn execute_sequencer_transactions<DB: Database>(
         &self,
         db: &mut State<DB>,
     ) -> Result<ExecutionInfo, PayloadBuilderError>
@@ -758,13 +768,9 @@ where
         DB: Database<Error = ProviderError>,
     {
         let mut info = ExecutionInfo::with_capacity(self.attributes().transactions.len());
-        let mut executor = Executor::new(
-            self.initialized_cfg.clone(),
-            &self.evm_config,
-            self.initialized_block_env.clone(),
-            db,
-            0,
-        );
+        let mut tx_executor = self
+            .executor
+            .tx_executor(self.initialized_block_env.clone(), db);
 
         for sequencer_tx in &self.attributes().transactions {
             // A sequencer's block should never contain blob transactions.
@@ -786,10 +792,11 @@ where
                     PayloadBuilderError::other(OpPayloadBuilderError::TransactionEcRecoverFailed)
                 })?;
 
-            match executor.execute(sequencer_tx) {
-                Ok((uncommitted, executed)) => {
-                    uncommitted.commit();
-                    info.add(executed.into());
+            match tx_executor.execute(&sequencer_tx) {
+                Ok((result, state)) => {
+                    tx_executor.commit(state);
+                    let receipt = tx_executor.receipt(result, &sequencer_tx);
+                    // info.add(executed.into());
                 }
                 Err(err) => {
                     // match err {
@@ -813,13 +820,17 @@ where
     /// Executes the given best transactions and updates the execution info.
     ///
     /// Returns `Ok(Some(())` if the job was cancelled.
-    pub fn execute_best_transactions(
+    pub fn execute_best_transactions<DB, P>(
         &self,
         info: &mut ExecutionInfo,
-        db: &mut State<impl Database<Error = ProviderError>>,
-        mut best_txs: impl PayloadTransactions<Transaction = EvmConfig::Transaction>,
+        db: &mut State<DB>,
+        mut best_txs: P,
         block_gas_limit: u64,
-    ) -> Result<Option<()>, PayloadBuilderError> {
+    ) -> Result<Option<()>, PayloadBuilderError>
+    where
+        DB: Database<Error = ProviderError>,
+        P: PayloadTransactions<Transaction = Executor::Transaction>,
+    {
         let execute_txs_start_time = Instant::now();
         let mut num_txs_considered = 0;
         let mut num_txs_simulated = 0;
@@ -827,13 +838,9 @@ where
         let mut num_txs_simulated_fail = 0;
         let base_fee = self.base_fee();
 
-        let mut executor = Executor::new(
-            self.initialized_cfg.clone(),
-            &self.evm_config,
-            self.initialized_block_env.clone(),
-            db,
-            base_fee,
-        );
+        let mut tx_executor = self
+            .executor
+            .tx_executor(self.initialized_block_env.clone(), db);
 
         while let Some(tx) = best_txs.next(()) {
             num_txs_considered += 1;
@@ -859,16 +866,14 @@ where
 
             let tx_simulation_start_time = Instant::now();
 
-            match executor.execute(tx) {
-                Ok((uncommitted, executed)) => {
+            match tx_executor.execute(&tx) {
+                Ok((result, state)) => {
                     self.metrics
                         .tx_simulation_duration
                         .record(tx_simulation_start_time.elapsed());
-                    self.metrics
-                        .tx_byte_size
-                        .record(executed.tx().size() as f64);
+                    self.metrics.tx_byte_size.record(tx.size() as f64);
                     num_txs_simulated += 1;
-                    if executed.is_success() {
+                    if result.is_success() {
                         num_txs_simulated_success += 1;
                     } else {
                         num_txs_simulated_fail += 1;
@@ -883,8 +888,9 @@ where
                         .payload_num_tx_simulated_fail
                         .record(num_txs_simulated_fail as f64);
 
-                    uncommitted.commit();
-                    info.add(executed.into());
+                    tx_executor.commit(state);
+                    let receipt = tx_executor.receipt(result, &tx);
+                    // info.add(executed.into());
                 }
                 Err(err) => {
                     // match err {
@@ -961,23 +967,18 @@ where
                 // Sign the transaction
                 let builder_tx = signer.sign_tx(tx).map_err(PayloadBuilderError::other)?;
 
-                // NOTE(dshulyak) is it intentional that fee from builder tx is not added to the info?
-                let mut executor = Executor::new(
-                    self.initialized_cfg.clone(),
-                    &self.evm_config,
-                    self.initialized_block_env.clone(),
-                    db,
-                    0,
-                );
+                let mut tx_executor = self
+                    .executor
+                    .tx_executor(self.initialized_block_env.clone(), db);
 
-                let (uncommitted, executed) = executor.execute(builder_tx).expect("todo errors");
+                let (_) = tx_executor.execute(&builder_tx).expect("todo errors");
                 // .map_err(PayloadBuilderError::EvmExecutionError)?;
 
-                uncommitted.commit();
+                // uncommitted.commit();
                 // Release the db reference by dropping evm
                 // NOTE(dshulyak) why it was necessary?
                 // drop(executor);
-                info.add(executed.into());
+                // info.add(executed.into());
                 Ok(())
             })
             .transpose()

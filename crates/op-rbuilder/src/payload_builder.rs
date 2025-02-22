@@ -739,14 +739,14 @@ where
             // Convert the transaction to a [TransactionSignedEcRecovered]. This is
             // purely for the purposes of utilizing the `evm_config.tx_env`` function.
             // Deposit transactions do not have signatures, so if the tx is a deposit, this
-            // will just pull in its `from` address.
-            let tx = sequencer_tx
-                .value()
-                .clone()
-                .try_into_ecrecovered()
-                .map_err(|_| {
-                    PayloadBuilderError::other(OpPayloadBuilderError::TransactionEcRecoverFailed)
-                })?;
+                // will just pull in its `from` address.
+                let tx = sequencer_tx
+                    .value()
+                    .clone()
+                    .try_into_ecrecovered()
+                    .map_err(|_| {
+                        PayloadBuilderError::other(OpPayloadBuilderError::TransactionEcRecoverFailed)
+                    })?;
 
             executor.execute(tx).map_or_else(
                 |err| {
