@@ -2,6 +2,7 @@ use std::{fmt::Display, sync::Arc, sync::Mutex};
 
 use crate::generator::{BlockCell, BuildArguments, PayloadBuilder};
 use crate::tx_executor::{Executor, TxExecutionInfo};
+
 use alloy_consensus::{Header, Transaction, Typed2718, EMPTY_OMMER_ROOT_HASH};
 use alloy_eips::merge::BEACON_NONCE;
 use alloy_primitives::{Address, Bytes, B256, U256};

@@ -1,7 +1,7 @@
 use clap::Parser;
 use generator::CustomOpPayloadBuilder;
 use monitoring::Monitoring;
-use payload_builder_vanilla::OpPayloadBuilderVanilla;
+use payload_builder_vanilla::{DefaultOpBuilderStrategy, OpPayloadBuilderVanilla};
 use reth::builder::Node;
 use reth::providers::CanonStateSubscriptions;
 use reth::{
@@ -22,9 +22,9 @@ mod metrics;
 mod monitoring;
 pub mod payload_builder;
 mod payload_builder_vanilla;
-mod tx_executor;
 #[cfg(test)]
 mod tester;
+mod tx_executor;
 mod tx_signer;
 
 fn main() {
@@ -35,6 +35,7 @@ fn main() {
             let vanilla_builder = OpPayloadBuilderVanilla::new(
                 OpEvmConfig::new(builder.config().chain.clone()),
                 builder_args.builder_signer,
+                DefaultOpBuilderStrategy{},
             );
 
             let engine_tree_config = TreeConfig::default()

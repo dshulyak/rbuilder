@@ -3,8 +3,7 @@ use std::{fmt::Display, sync::Arc, time::Instant};
 
 use crate::generator::BuildArguments;
 use crate::tx_executor::{
-    CallExecutor, OpExecutor, PreBlockHashesContractCall, StateExecutor, TxExecutionInfo,
-    TxExecutor,
+    OpExecutionResult, OpTxExecutor, StateAccess, TxExecutionInfo, TxExecutor,
 };
 use crate::{
     generator::{BlockCell, PayloadBuilder},
@@ -48,18 +47,16 @@ use reth_revm::database::StateProviderDatabase;
 use reth_transaction_pool::pool::BestPayloadTransactions;
 use reth_transaction_pool::PoolTransaction;
 use reth_transaction_pool::{BestTransactionsAttributes, TransactionPool};
-use revm::primitives::ExecutionResult;
-use revm::{
-    db::{states::bundle_state::BundleRetention, State},
-    primitives::BlockEnv,
-    Database, DatabaseCommit,
-};
+use revm::interpreter::check;
+use revm::primitives::{EVMError, InvalidTransaction};
+use revm::State;
+use revm::{db::states::bundle_state::BundleRetention, primitives::BlockEnv, Database};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, trace, warn};
 
 /// Optimism's payload builder
 #[derive(Debug, Clone)]
-pub struct OpPayloadBuilderVanilla<Txs = ()> {
+pub struct OpPayloadBuilderVanilla<Strategy, Txs = BestPoolTransactions> {
     /// The type responsible for creating the evm.
     pub evm_config: OpEvmConfig,
     /// The builder's signer key to use for an end of block tx
@@ -69,24 +66,32 @@ pub struct OpPayloadBuilderVanilla<Txs = ()> {
     pub best_transactions: Txs,
     /// The metrics for the builder
     pub metrics: OpRBuilderMetrics,
+    // Strategy to use for building payload.
+    pub strategy: Strategy,
 }
 
-impl OpPayloadBuilderVanilla {
+impl<Strategy> OpPayloadBuilderVanilla<Strategy> {
     /// `OpPayloadBuilder` constructor.
-    pub fn new(evm_config: OpEvmConfig, builder_signer: Option<Signer>) -> Self {
+    pub fn new(
+        evm_config: OpEvmConfig,
+        builder_signer: Option<Signer>,
+        strategy: Strategy,
+    ) -> Self {
         Self {
             evm_config,
             builder_signer,
-            best_transactions: (),
+            best_transactions: BestPoolTransactions,
             metrics: Default::default(),
+            strategy,
         }
     }
 }
 
-impl<Pool, Client> PayloadBuilder<Pool, Client> for OpPayloadBuilderVanilla
+impl<Strategy, Pool, Client> PayloadBuilder<Pool, Client> for OpPayloadBuilderVanilla<Strategy>
 where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec = OpChainSpec>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = OpTransactionSigned>>,
+    Strategy: OpBuilderStrategy + Clone + Send + Sync + 'static,
 {
     type Attributes = OpPayloadBuilderAttributes;
     type BuiltPayload = OpBuiltPayload;
@@ -99,10 +104,14 @@ where
         let pool = args.pool.clone();
         let block_build_start_time = Instant::now();
 
-        match self.build_payload(args, |attrs| {
-            #[allow(clippy::unit_arg)]
-            self.best_transactions.best_transactions(pool, attrs)
-        })? {
+        match self.build_payload(
+            args,
+            |attrs| {
+                #[allow(clippy::unit_arg)]
+                self.best_transactions.best_transactions(pool, attrs)
+            },
+            self.strategy.clone(),
+        )? {
             BuildOutcome::Better { payload, .. } => {
                 best_payload.set(payload);
                 self.metrics
@@ -130,7 +139,10 @@ where
     }
 }
 
-impl OpPayloadBuilderVanilla {
+impl<Strategy> OpPayloadBuilderVanilla<Strategy>
+where
+    Strategy: OpBuilderStrategy,
+{
     /// Constructs an Optimism payload from the transactions sent via the
     /// Payload attributes by the sequencer. If the `no_tx_pool` argument is passed in
     /// the payload attributes, the transaction pool will be ignored and the only transactions
@@ -143,6 +155,7 @@ impl OpPayloadBuilderVanilla {
         &self,
         args: BuildArguments<Pool, Client, OpPayloadBuilderAttributes>,
         best: impl FnOnce(BestTransactionsAttributes) -> Txs + Send + Sync + 'a,
+        strategy: Strategy,
     ) -> Result<BuildOutcome<OpBuiltPayload>, PayloadBuilderError>
     where
         Client: StateProviderFactory + ChainSpecProvider<ChainSpec = OpChainSpec>,
@@ -165,9 +178,7 @@ impl OpPayloadBuilderVanilla {
             cancel,
         } = args;
 
-        let executor = OpExecutor::new(cfg_env_with_handler_cfg, self.evm_config.clone());
         let ctx = OpPayloadBuilderCtx {
-            executor,
             chain_spec: client.chain_spec(),
             config,
             initialized_block_env: block_env,
@@ -175,25 +186,33 @@ impl OpPayloadBuilderVanilla {
             builder_signer: self.builder_signer,
             metrics: Default::default(),
         };
-
-        let builder = OpBuilder::new(best);
-
-        let state_provider = client.state_by_block_hash(ctx.parent().hash())?;
-        let state = StateProviderDatabase::new(state_provider);
+        let state = StateProviderDatabase::new(client.state_by_block_hash(ctx.parent().hash())?);
 
         if ctx.attributes().no_tx_pool {
-            let db = State::builder()
+            let mut state = State::builder()
                 .with_database(state)
                 .with_bundle_update()
                 .build();
-            builder.build(db, ctx)
+            let executor = OpTxExecutor::new(
+                ctx.initialized_block_env.clone(),
+                cfg_env_with_handler_cfg,
+                &self.evm_config,
+                &mut state,
+            );
+            strategy.execute(ctx, executor, best)
         } else {
             // sequencer mode we can reuse cachedreads from previous runs
-            let db = State::builder()
+            let mut state = State::builder()
                 .with_database(cached_reads.as_db_mut(state))
                 .with_bundle_update()
                 .build();
-            builder.build(db, ctx)
+            let executor = OpTxExecutor::new(
+                ctx.initialized_block_env.clone(),
+                cfg_env_with_handler_cfg,
+                &self.evm_config,
+                &mut state,
+            );
+            strategy.execute(ctx, executor, best)
         }
         .map(|out| out.with_cached_reads(cached_reads))
     }
@@ -218,7 +237,42 @@ impl<Txs> OpPayloadBuilderVanilla<Txs> {
     }
 }
 
-/// The type that builds the payload.
+
+#[macro_export]
+macro_rules! check {
+    ($cond:expr, $rst:expr) => {
+        if $cond {
+            return $rst;
+        }
+    };
+}
+
+macro_rules! skip {
+    // Pattern for expression and block
+    ($condition:expr, $block:block) => {
+        if $condition {
+            $block
+            continue;
+        }
+    };
+
+    // Pattern for just expression
+    ($condition:expr, $expr:expr) => {
+        if $condition {
+            $expr;
+            continue;
+        }
+    };
+
+    // Pattern for condition only
+    ($condition:expr) => {
+        if $condition {
+            continue;
+        }
+    };
+}
+
+/// The strategy that builds the payload.
 ///
 /// Payload building for optimism is composed of several steps.
 /// The first steps are mandatory and defined by the protocol.
@@ -233,129 +287,101 @@ impl<Txs> OpPayloadBuilderVanilla<Txs> {
 ///
 /// And finally
 /// 5. build the block: compute all roots (txs, state)
-#[derive(derive_more::Debug)]
-pub struct OpBuilder<'a, Txs> {
-    /// Yields the best transaction to include if transactions from the mempool are allowed.
-    best: Box<dyn FnOnce(BestTransactionsAttributes) -> Txs + 'a>,
-}
-
-impl<'a, Txs> OpBuilder<'a, Txs> {
-    fn new(best: impl FnOnce(BestTransactionsAttributes) -> Txs + Send + Sync + 'a) -> Self {
-        Self {
-            best: Box::new(best),
-        }
-    }
-}
-
-impl<Txs> OpBuilder<'_, Txs>
-where
-    Txs: PayloadTransactions<Transaction = OpTransactionSigned>,
-{
+pub trait OpBuilderStrategy {
     /// Executes the payload and returns the outcome.
-    pub fn execute<Executor, DB>(
-        self,
-        state: &mut State<DB>,
-        ctx: &OpPayloadBuilderCtx<Executor>,
-    ) -> Result<BuildOutcomeKind<ExecutedPayload>, PayloadBuilderError>
+    fn execute<'a, Executor, DB, P, Txs, TxsFn>(
+        &self,
+        ctx: OpPayloadBuilderCtx,
+        mut executor: Executor,
+        best: TxsFn,
+    ) -> Result<BuildOutcomeKind<OpBuiltPayload>, PayloadBuilderError>
     where
-        Executor: StateExecutor<
+        Executor: TxExecutor<
+                'a,
+                DB,
                 Transaction = OpTransactionSigned,
-                Receipt = OpReceipt,
-                ExecutionResult = ExecutionResult,
-            > + for<'a> CallExecutor<PreBlockHashesContractCall, Params<'a> = (&'a BlockEnv)>,
-        DB: Database<Error = ProviderError>,
+                ExecutionResult = OpExecutionResult,
+            > + StateAccess<'a, DB>,
+        TxsFn: FnOnce(BestTransactionsAttributes) -> Txs + Send + Sync + 'a,
+        Txs: PayloadTransactions<Transaction = OpTransactionSigned>,
+        DB: Database<Error = ProviderError> + AsRef<P>,
+        P: StateRootProvider + HashedPostStateProvider,
     {
-        let Self { best } = self;
         info!(target: "payload_builder", id=%ctx.payload_id(), parent_header = ?ctx.parent().hash(), parent_number = ctx.parent().number, "building new payload");
 
         // 1. apply eip-4788 pre block contract call
-        ctx.apply_pre_beacon_root_contract_call(state)?;
-
         // 2. ensure create2deployer is force deployed
-        ctx.ensure_create2_deployer(state)?;
-
-        let sequencer_tx_start_time = Instant::now();
+        self.apply_pre_block(&ctx, &mut executor)?;
 
         // 3. execute sequencer transactions
-        let mut info = ctx.execute_sequencer_transactions(state)?;
-
-        ctx.metrics
-            .sequencer_tx_duration
-            .record(sequencer_tx_start_time.elapsed());
-
-        // 4. if mem pool transactions are requested we execute them
+        let mut info = self.execute_sequencer_transactions(&ctx, &mut executor)?;
 
         // gas reserved for builder tx
-        let message = format!("Block Number: {}", ctx.block_number())
-            .as_bytes()
-            .to_vec();
-        let builder_tx_gas = ctx.builder_signer().map_or(0, |_| {
-            OpPayloadBuilderCtx::<Executor>::estimate_gas_for_builder_tx(message.clone())
-        });
+        let message = self.block_message(&ctx);
+        let builder_tx_gas = ctx
+            .builder_signer()
+            .map_or(0, |_| estimate_gas_for_builder_tx(&message));
         let block_gas_limit = ctx.block_gas_limit() - builder_tx_gas;
+
+        // 4. if mem pool transactions are requested we execute them
         if !ctx.attributes().no_tx_pool {
-            let best_txs_start_time = Instant::now();
-            let best_txs = best(ctx.best_transaction_attributes());
-            ctx.metrics
-                .transaction_pool_fetch_duration
-                .record(best_txs_start_time.elapsed());
-            if ctx
-                .execute_best_transactions(&mut info, state, best_txs, block_gas_limit)?
-                .is_some()
-            {
-                return Ok(BuildOutcomeKind::Cancelled);
-            }
+            check!(
+                self.execute_best_transactions(
+                    &ctx,
+                    &mut executor,
+                    &mut info,
+                    best,
+                    block_gas_limit
+                )?
+                .is_some(),
+                Ok(BuildOutcomeKind::Cancelled)
+            );
         }
 
         // Add builder tx to the block
-        ctx.add_builder_tx(&mut info, state, builder_tx_gas, message);
+        self.add_builder_tx(&ctx, &mut executor, &mut info, builder_tx_gas, message);
+        if ctx.attributes().no_tx_pool {
+            Ok(BuildOutcomeKind::Freeze(self.create_payload(
+                executor.db_mut(),
+                ctx,
+                info,
+            )?))
+        } else {
+            Ok(BuildOutcomeKind::Better {
+                payload: self.create_payload(executor.db_mut(), ctx, info)?,
+            })
+        }
+    }
 
+    fn block_message(&self, ctx: &OpPayloadBuilderCtx) -> Vec<u8> {
+        format!("Block Number: {}", ctx.block_number())
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// Builds the payload on top of the state.
+    fn create_payload<DB, P>(
+        &self,
+        state: &mut State<DB>,
+        ctx: OpPayloadBuilderCtx,
+        info: ExecutionInfo,
+    ) -> Result<OpBuiltPayload, PayloadBuilderError>
+    where
+        DB: Database<Error = ProviderError> + AsRef<P>,
+        P: StateRootProvider + HashedPostStateProvider,
+    {
         let withdrawals_root = ctx.commit_withdrawals(state)?;
 
         let state_merge_start_time = Instant::now();
-
         // merge all transitions into bundle state, this would apply the withdrawal balance changes
         // and 4788 contract call
         state.merge_transitions(BundleRetention::Reverts);
-
         ctx.metrics
             .state_transition_merge_duration
             .record(state_merge_start_time.elapsed());
         ctx.metrics
             .payload_num_tx
             .record(info.executed_transactions.len() as f64);
-
-        Ok(BuildOutcomeKind::Better {
-            payload: ExecutedPayload {
-                info,
-                withdrawals_root,
-            },
-        })
-    }
-
-    /// Builds the payload on top of the state.
-    pub fn build<Executor, DB, P>(
-        self,
-        mut state: State<DB>,
-        ctx: OpPayloadBuilderCtx<Executor>,
-    ) -> Result<BuildOutcomeKind<OpBuiltPayload>, PayloadBuilderError>
-    where
-        Executor: StateExecutor<
-                Transaction = OpTransactionSigned,
-                Receipt = OpReceipt,
-                ExecutionResult = ExecutionResult,
-            > + for<'a> CallExecutor<PreBlockHashesContractCall, Params<'a> = (&'a BlockEnv)>,
-        DB: Database<Error = ProviderError> + AsRef<P>,
-        P: StateRootProvider + HashedPostStateProvider,
-    {
-        let ExecutedPayload {
-            info,
-            withdrawals_root,
-        } = match self.execute(&mut state, &ctx)? {
-            BuildOutcomeKind::Better { payload } | BuildOutcomeKind::Freeze(payload) => payload,
-            BuildOutcomeKind::Cancelled => return Ok(BuildOutcomeKind::Cancelled),
-            BuildOutcomeKind::Aborted { fees } => return Ok(BuildOutcomeKind::Aborted { fees }),
-        };
 
         let block_number = ctx.block_number();
         let execution_outcome = ExecutionOutcome::new(
@@ -454,9 +480,6 @@ where
             hashed_state: Arc::new(hashed_state),
             trie: Arc::new(trie_output),
         };
-
-        let no_tx_pool = ctx.attributes().no_tx_pool;
-
         let payload = OpBuiltPayload::new(
             ctx.payload_id(),
             sealed_block,
@@ -465,21 +488,308 @@ where
             ctx.config.attributes,
             Some(executed),
         );
-
         ctx.metrics
             .payload_byte_size
             .record(payload.block().size() as f64);
+        Ok(payload)
+    }
 
-        if no_tx_pool {
-            // if `no_tx_pool` is set only transactions from the payload attributes will be included
-            // in the payload. In other words, the payload is deterministic and we can
-            // freeze it once we've successfully built it.
-            Ok(BuildOutcomeKind::Freeze(payload))
-        } else {
-            Ok(BuildOutcomeKind::Better { payload })
+    /// Apply eip-4788 pre block contract call
+    /// and
+    /// Ensure that the create2deployer is force-deployed at the canyon transition. Optimism
+    /// blocks will always have at least a single transaction in them (the L1 info transaction),
+    /// so we can safely assume that this will always be triggered upon the transition and that
+    /// the above check for empty blocks will never be hit on OP chains.
+    fn apply_pre_block<'a, State, DB>(
+        &self,
+        ctx: &OpPayloadBuilderCtx,
+        state: &mut State,
+    ) -> Result<(), PayloadBuilderError>
+    where
+        DB: Database,
+        DB::Error: Display,
+        State: StateAccess<'a, DB>,
+    {
+        // SystemCaller::new(self.evm_config.clone(), self.chain_spec.clone())
+        //     .pre_block_beacon_root_contract_call(
+        //         db,
+        //         &self.initialized_cfg,
+        //         &self.initialized_block_env,
+        //         self.attributes()
+        //             .payload_attributes
+        //             .parent_beacon_block_root,
+        //     )
+        //     .map_err(|err| {
+        //         warn!(target: "payload_builder",
+        //             parent_header=%self.parent().hash(),
+        //             %err,
+        //             "failed to apply beacon root contract call for payload"
+        //         );
+        //         PayloadBuilderError::Internal(err.into())
+        //     })?;
+        reth_optimism_evm::ensure_create2_deployer(
+            ctx.chain_spec.clone(),
+            ctx.attributes().payload_attributes.timestamp,
+            state.db_mut(),
+        )
+        .map_err(|err| {
+            warn!(target: "payload_builder", %err, "missing create2 deployer, skipping block.");
+            PayloadBuilderError::other(OpPayloadBuilderError::ForceCreate2DeployerFail)
+        })?;
+        Ok(())
+    }
+
+    /// Executes all sequencer transactions that are included in the payload attributes.
+    fn execute_sequencer_transactions<'a, Executor, DB>(
+        &self,
+        ctx: &OpPayloadBuilderCtx,
+        executor: &mut Executor,
+    ) -> Result<ExecutionInfo, PayloadBuilderError>
+    where
+        DB: Database<Error = ProviderError>,
+        Executor: TxExecutor<
+            'a,
+            DB,
+            Transaction = OpTransactionSigned,
+            ExecutionResult = OpExecutionResult,
+        >,
+    {
+        let sequencer_tx_start_time = Instant::now();
+        let mut info = ExecutionInfo::with_capacity(ctx.attributes().transactions.len());
+
+        for sequencer_tx in &ctx.attributes().transactions {
+            // A sequencer's block should never contain blob transactions.
+            check!(
+                sequencer_tx.value().is_eip4844(),
+                Err(PayloadBuilderError::other(
+                    OpPayloadBuilderError::BlobTransactionRejected,
+                ))
+            );
+
+            // Convert the transaction to a [TransactionSignedEcRecovered]. This is
+            // purely for the purposes of utilizing the `evm_config.tx_env`` function.
+            // Deposit transactions do not have signatures, so if the tx is a deposit, this
+            // will just pull in its `from` address.
+            let tx = sequencer_tx
+                .value()
+                .clone()
+                .try_into_ecrecovered()
+                .map_err(|_| {
+                    PayloadBuilderError::other(OpPayloadBuilderError::TransactionEcRecoverFailed)
+                })?;
+
+            executor.execute(&tx).map_or_else(|err| {
+                match err {
+                    EVMError::Transaction(err) => {
+                        trace!(target: "payload_builder", %err, ?tx, "Error in sequencer transaction, skipping.");
+                        Ok(())
+                    }
+                    err => {
+                        // this is an error that we should treat as fatal for this attempt
+                        Err(PayloadBuilderError::EvmExecutionError(err))
+                    }
+                }
+            },|rst| {
+                Ok(())
+            })?;
         }
+        ctx.metrics
+            .sequencer_tx_duration
+            .record(sequencer_tx_start_time.elapsed());
+        Ok(info)
+    }
+
+    /// Executes the given best transactions and updates the execution info.
+    ///
+    /// Returns `Ok(Some(())` if the job was cancelled.
+    fn execute_best_transactions<'a, Executor, DB, Txs, TxsFn>(
+        &self,
+        ctx: &OpPayloadBuilderCtx,
+        executor: &mut Executor,
+        info: &mut ExecutionInfo,
+        best_txs: TxsFn,
+        block_gas_limit: u64,
+    ) -> Result<Option<()>, PayloadBuilderError>
+    where
+        DB: Database<Error = ProviderError>,
+        TxsFn: FnOnce(BestTransactionsAttributes) -> Txs + Send + Sync + 'a,
+        Txs: PayloadTransactions<Transaction = OpTransactionSigned>,
+        Executor: TxExecutor<
+            'a,
+            DB,
+            Transaction = OpTransactionSigned,
+            ExecutionResult = OpExecutionResult,
+        >,
+    {
+        let best_txs_start_time = Instant::now();
+        let mut best_txs = best_txs(ctx.best_transaction_attributes());
+        ctx.metrics
+            .transaction_pool_fetch_duration
+            .record(best_txs_start_time.elapsed());
+
+        let execute_txs_start_time = Instant::now();
+        let mut num_txs_considered = 0;
+        let mut num_txs_simulated = 0;
+        let mut num_txs_simulated_success = 0;
+        let mut num_txs_simulated_fail = 0;
+        let base_fee = ctx.base_fee();
+
+        while let Some(tx) = best_txs.next(()) {
+            check!(ctx.cancel.is_cancelled(), Ok(Some(())));
+            skip!(info.executed_transactions.contains(&tx));
+
+            num_txs_considered += 1;
+
+            // ensure we still have capacity for this transaction
+            // we can't fit this transaction into the block, so we need to mark it as
+            // invalid which also removes all dependent transaction from
+            // the iterator before we can continue
+            skip!(
+                info.cumulative_gas_used + tx.gas_limit() > block_gas_limit,
+                best_txs.mark_invalid(tx.signer(), tx.nonce())
+            );
+            // a sequencer's block should never contain blob or deposit transactions from the pool.
+            skip!(
+                tx.is_eip4844() || tx.tx_type() == TxType::Deposit as u8,
+                best_txs.mark_invalid(tx.signer(), tx.nonce())
+            );
+
+            let tx_simulation_start_time = Instant::now();
+
+            match executor.transact(&tx) {
+                Ok((result, state)) => {
+                    ctx.metrics
+                        .tx_simulation_duration
+                        .record(tx_simulation_start_time.elapsed());
+                    ctx.metrics.tx_byte_size.record(tx.size() as f64);
+                    num_txs_simulated += 1;
+                    if result.is_success() {
+                        num_txs_simulated_success += 1;
+                    } else {
+                        num_txs_simulated_fail += 1;
+                    }
+                    ctx.metrics
+                        .payload_num_tx_simulated
+                        .record(num_txs_simulated as f64);
+                    ctx.metrics
+                        .payload_num_tx_simulated_success
+                        .record(num_txs_simulated_success as f64);
+                    ctx.metrics
+                        .payload_num_tx_simulated_fail
+                        .record(num_txs_simulated_fail as f64);
+
+                    executor.commit(state);
+                    let receipt = result.receipt();
+                    // info.add(executed.into());
+                }
+                Err(err) => {
+                    match err {
+                        EVMError::Transaction(err) => {
+                            if matches!(err, InvalidTransaction::NonceTooLow { .. }) {
+                                // if the nonce is too low, we can skip this transaction
+                                trace!(target: "payload_builder", %err, ?tx, "skipping nonce too low transaction");
+                            } else {
+                                // if the transaction is invalid, we can skip it and all of its
+                                // descendants
+                                trace!(target: "payload_builder", %err, ?tx, "skipping invalid transaction and its descendants");
+                                best_txs.mark_invalid(tx.signer(), tx.nonce());
+                            }
+                        }
+                        err => {
+                            // this is an error that we should treat as fatal for this attempt
+                            return Err(PayloadBuilderError::EvmExecutionError(err));
+                        }
+                    }
+                }
+            };
+        }
+
+        ctx.metrics
+            .payload_tx_simulation_duration
+            .record(execute_txs_start_time.elapsed());
+        ctx.metrics
+            .payload_num_tx_considered
+            .record(num_txs_considered as f64);
+
+        Ok(None)
+    }
+
+    fn add_builder_tx<'a, Executor, DB>(
+        &self,
+        ctx: &OpPayloadBuilderCtx,
+        executor: &mut Executor,
+        info: &mut ExecutionInfo,
+        builder_tx_gas: u64,
+        message: Vec<u8>,
+    ) -> Option<()>
+    where
+        DB: Database<Error = ProviderError>,
+        Executor: TxExecutor<
+                'a,
+                DB,
+                Transaction = OpTransactionSigned,
+                ExecutionResult = OpExecutionResult,
+            > + StateAccess<'a, DB>,
+    {
+        ctx.builder_signer()
+            .map(|signer| {
+                let base_fee = ctx.base_fee();
+                // Create message with block number for the builder to sign
+                let nonce = executor
+                    .db_mut()
+                    .load_cache_account(signer.address)
+                    .map(|acc| acc.account_info().unwrap_or_default().nonce)
+                    .map_err(|_| {
+                        PayloadBuilderError::other(OpPayloadBuilderError::AccountLoadFailed(
+                            signer.address,
+                        ))
+                    })?;
+
+                // Create the EIP-1559 transaction
+                let eip1559 = OpTypedTransaction::Eip1559(TxEip1559 {
+                    chain_id: ctx.chain_id(),
+                    nonce,
+                    gas_limit: builder_tx_gas,
+                    max_fee_per_gas: base_fee.into(),
+                    max_priority_fee_per_gas: 0,
+                    to: TxKind::Call(Address::ZERO),
+                    // Include the message as part of the transaction data
+                    input: message.into(),
+                    ..Default::default()
+                });
+
+                // Sign the transaction
+                let builder_tx = signer
+                    .sign_tx(eip1559)
+                    .map_err(PayloadBuilderError::other)?;
+
+                let receipt = executor
+                    .execute(&builder_tx)
+                    .map_err(PayloadBuilderError::EvmExecutionError)?;
+
+                // Release the db reference by dropping evm
+                // NOTE(dshulyak) why it was necessary?
+                // drop(executor);
+                // info.add(executed.into());
+                Ok(())
+            })
+            .transpose()
+            .unwrap_or_else(|err: PayloadBuilderError| {
+                warn!(target: "payload_builder", %err, "Failed to add builder transaction");
+                None
+            })
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct DefaultOpBuilderStrategy;
+
+impl OpBuilderStrategy for DefaultOpBuilderStrategy {}
+
+#[derive(Debug, Clone)]
+pub struct FlashblocksBuilderStrategy;
+
+impl OpBuilderStrategy for FlashblocksBuilderStrategy {}
 
 /// A type that returns a the [`PayloadTransactions`] that should be included in the pool.
 pub trait OpPayloadTransactions: Clone + Send + Sync + Unpin + 'static {
@@ -494,7 +804,11 @@ pub trait OpPayloadTransactions: Clone + Send + Sync + Unpin + 'static {
     ) -> impl PayloadTransactions<Transaction = OpTransactionSigned>;
 }
 
-impl OpPayloadTransactions for () {
+/// BestPoolTransactions will yield best transactions from the pool.
+#[derive(Clone, Debug)]
+pub struct BestPoolTransactions;
+
+impl OpPayloadTransactions for BestPoolTransactions {
     fn best_transactions<
         Pool: TransactionPool<Transaction: PoolTransaction<Consensus = OpTransactionSigned>>,
     >(
@@ -504,15 +818,6 @@ impl OpPayloadTransactions for () {
     ) -> impl PayloadTransactions<Transaction = OpTransactionSigned> {
         BestPayloadTransactions::new(pool.best_transactions_with_attributes(attr))
     }
-}
-
-/// Holds the state after execution
-#[derive(Debug)]
-pub struct ExecutedPayload {
-    /// Tracked execution info
-    pub info: ExecutionInfo,
-    /// Withdrawal hash.
-    pub withdrawals_root: Option<B256>,
 }
 
 /// This acts as the container for executed transactions and its byproducts (receipts, gas used)
@@ -553,9 +858,7 @@ impl ExecutionInfo {
 
 /// Container type that holds all necessities to build a new payload.
 #[derive(Debug)]
-pub struct OpPayloadBuilderCtx<Executor> {
-    /// Transactions and syscalls executor.
-    executor: Executor,
+pub struct OpPayloadBuilderCtx {
     /// The chainspec
     pub chain_spec: Arc<OpChainSpec>,
     /// How to build the payload.
@@ -570,7 +873,7 @@ pub struct OpPayloadBuilderCtx<Executor> {
     pub metrics: OpRBuilderMetrics,
 }
 
-impl<Executor> OpPayloadBuilderCtx<Executor> {
+impl OpPayloadBuilderCtx {
     /// Returns the parent block the payload will be build on.
     pub fn parent(&self) -> &SealedHeader {
         &self.config.parent_header
@@ -699,309 +1002,25 @@ impl<Executor> OpPayloadBuilderCtx<Executor> {
             &self.attributes().payload_attributes.withdrawals,
         )
     }
-
-    /// Ensure that the create2deployer is force-deployed at the canyon transition. Optimism
-    /// blocks will always have at least a single transaction in them (the L1 info transaction),
-    /// so we can safely assume that this will always be triggered upon the transition and that
-    /// the above check for empty blocks will never be hit on OP chains.
-    pub fn ensure_create2_deployer<DB>(&self, db: &mut State<DB>) -> Result<(), PayloadBuilderError>
-    where
-        DB: Database,
-        DB::Error: Display,
-    {
-        reth_optimism_evm::ensure_create2_deployer(
-            self.chain_spec.clone(),
-            self.attributes().payload_attributes.timestamp,
-            db,
-        )
-        .map_err(|err| {
-            warn!(target: "payload_builder", %err, "missing create2 deployer, skipping block.");
-            PayloadBuilderError::other(OpPayloadBuilderError::ForceCreate2DeployerFail)
-        })
-    }
 }
 
-impl<Executor> OpPayloadBuilderCtx<Executor>
-where
-    Executor: StateExecutor<
-            Transaction = OpTransactionSigned,
-            Receipt = OpReceipt,
-            ExecutionResult = ExecutionResult,
-        > + for<'a> CallExecutor<PreBlockHashesContractCall, Params<'a> = (&'a BlockEnv)>,
-{
-    /// apply eip-4788 pre block contract call
-    pub fn apply_pre_beacon_root_contract_call<DB>(
-        &self,
-        db: &mut DB,
-    ) -> Result<(), PayloadBuilderError>
-    where
-        DB: Database + DatabaseCommit,
-        DB::Error: Display,
-    {
-        // SystemCaller::new(self.evm_config.clone(), self.chain_spec.clone())
-        //     .pre_block_beacon_root_contract_call(
-        //         db,
-        //         &self.initialized_cfg,
-        //         &self.initialized_block_env,
-        //         self.attributes()
-        //             .payload_attributes
-        //             .parent_beacon_block_root,
-        //     )
-        //     .map_err(|err| {
-        //         warn!(target: "payload_builder",
-        //             parent_header=%self.parent().hash(),
-        //             %err,
-        //             "failed to apply beacon root contract call for payload"
-        //         );
-        //         PayloadBuilderError::Internal(err.into())
-        //     })?;
-        self.executor.syscall(db, (&self.initialized_block_env));
-        Ok(())
-    }
-
-    /// Executes all sequencer transactions that are included in the payload attributes.
-    pub fn execute_sequencer_transactions<DB: Database>(
-        &self,
-        db: &mut State<DB>,
-    ) -> Result<ExecutionInfo, PayloadBuilderError>
-    where
-        DB: Database<Error = ProviderError>,
-    {
-        let mut info = ExecutionInfo::with_capacity(self.attributes().transactions.len());
-        let mut tx_executor = self
-            .executor
-            .tx_executor(self.initialized_block_env.clone(), db);
-
-        for sequencer_tx in &self.attributes().transactions {
-            // A sequencer's block should never contain blob transactions.
-            if sequencer_tx.value().is_eip4844() {
-                return Err(PayloadBuilderError::other(
-                    OpPayloadBuilderError::BlobTransactionRejected,
-                ));
-            }
-
-            // Convert the transaction to a [TransactionSignedEcRecovered]. This is
-            // purely for the purposes of utilizing the `evm_config.tx_env`` function.
-            // Deposit transactions do not have signatures, so if the tx is a deposit, this
-            // will just pull in its `from` address.
-            let sequencer_tx = sequencer_tx
-                .value()
-                .clone()
-                .try_into_ecrecovered()
-                .map_err(|_| {
-                    PayloadBuilderError::other(OpPayloadBuilderError::TransactionEcRecoverFailed)
-                })?;
-
-            match tx_executor.execute(&sequencer_tx) {
-                Ok((result, state)) => {
-                    tx_executor.commit(state);
-                    let receipt = tx_executor.receipt(result, &sequencer_tx);
-                    // info.add(executed.into());
+fn estimate_gas_for_builder_tx(input: impl AsRef<[u8]>) -> u64 {
+    // Count zero and non-zero bytes
+    let (zero_bytes, nonzero_bytes) =
+        input
+            .as_ref()
+            .iter()
+            .fold((0, 0), |(zeros, nonzeros), &byte| {
+                if byte == 0 {
+                    (zeros + 1, nonzeros)
+                } else {
+                    (zeros, nonzeros + 1)
                 }
-                Err(err) => {
-                    // match err {
-                    //     EVMError::Transaction(err) => {
-                    //         trace!(target: "payload_builder", %err, ?sequencer_tx, "Error in sequencer transaction, skipping.");
-                    //         continue;
-                    //     }
-                    //     err => {
-                    //         // this is an error that we should treat as fatal for this attempt
-                    //         return Err(PayloadBuilderError::EvmExecutionError(err));
-                    //     }
-                    // }
-                    todo!();
-                }
-            }
-        }
+            });
 
-        Ok(info)
-    }
+    // Calculate gas cost (4 gas per zero byte, 16 gas per non-zero byte)
+    let zero_cost = zero_bytes * 4;
+    let nonzero_cost = nonzero_bytes * 16;
 
-    /// Executes the given best transactions and updates the execution info.
-    ///
-    /// Returns `Ok(Some(())` if the job was cancelled.
-    pub fn execute_best_transactions<DB, P>(
-        &self,
-        info: &mut ExecutionInfo,
-        db: &mut State<DB>,
-        mut best_txs: P,
-        block_gas_limit: u64,
-    ) -> Result<Option<()>, PayloadBuilderError>
-    where
-        DB: Database<Error = ProviderError>,
-        P: PayloadTransactions<Transaction = Executor::Transaction>,
-    {
-        let execute_txs_start_time = Instant::now();
-        let mut num_txs_considered = 0;
-        let mut num_txs_simulated = 0;
-        let mut num_txs_simulated_success = 0;
-        let mut num_txs_simulated_fail = 0;
-        let base_fee = self.base_fee();
-
-        let mut tx_executor = self
-            .executor
-            .tx_executor(self.initialized_block_env.clone(), db);
-
-        while let Some(tx) = best_txs.next(()) {
-            num_txs_considered += 1;
-            // ensure we still have capacity for this transaction
-            if info.cumulative_gas_used + tx.gas_limit() > block_gas_limit {
-                // we can't fit this transaction into the block, so we need to mark it as
-                // invalid which also removes all dependent transaction from
-                // the iterator before we can continue
-                best_txs.mark_invalid(tx.signer(), tx.nonce());
-                continue;
-            }
-
-            // A sequencer's block should never contain blob or deposit transactions from the pool.
-            if tx.is_eip4844() || tx.tx_type() == TxType::Deposit as u8 {
-                best_txs.mark_invalid(tx.signer(), tx.nonce());
-                continue;
-            }
-
-            // check if the job was cancelled, if so we can exit early
-            if self.cancel.is_cancelled() {
-                return Ok(Some(()));
-            }
-
-            let tx_simulation_start_time = Instant::now();
-
-            match tx_executor.execute(&tx) {
-                Ok((result, state)) => {
-                    self.metrics
-                        .tx_simulation_duration
-                        .record(tx_simulation_start_time.elapsed());
-                    self.metrics.tx_byte_size.record(tx.size() as f64);
-                    num_txs_simulated += 1;
-                    if result.is_success() {
-                        num_txs_simulated_success += 1;
-                    } else {
-                        num_txs_simulated_fail += 1;
-                    }
-                    self.metrics
-                        .payload_num_tx_simulated
-                        .record(num_txs_simulated as f64);
-                    self.metrics
-                        .payload_num_tx_simulated_success
-                        .record(num_txs_simulated_success as f64);
-                    self.metrics
-                        .payload_num_tx_simulated_fail
-                        .record(num_txs_simulated_fail as f64);
-
-                    tx_executor.commit(state);
-                    let receipt = tx_executor.receipt(result, &tx);
-                    // info.add(executed.into());
-                }
-                Err(err) => {
-                    // match err {
-                    //     EVMError::Transaction(err) => {
-                    //         if matches!(err, InvalidTransaction::NonceTooLow { .. }) {
-                    //             // if the nonce is too low, we can skip this transaction
-                    //             trace!(target: "payload_builder", %err, ?tx, "skipping nonce too low transaction");
-                    //         } else {
-                    //             // if the transaction is invalid, we can skip it and all of its
-                    //             // descendants
-                    //             trace!(target: "payload_builder", %err, ?tx, "skipping invalid transaction and its descendants");
-                    //             best_txs.mark_invalid(tx.signer(), tx.nonce());
-                    //         }
-
-                    //         continue;
-                    //     }
-                    //     err => {
-                    //         // this is an error that we should treat as fatal for this attempt
-                    //         return Err(PayloadBuilderError::EvmExecutionError(err));
-                    //     }
-                    // }
-                    todo!();
-                }
-            };
-        }
-
-        self.metrics
-            .payload_tx_simulation_duration
-            .record(execute_txs_start_time.elapsed());
-        self.metrics
-            .payload_num_tx_considered
-            .record(num_txs_considered as f64);
-
-        Ok(None)
-    }
-
-    pub fn add_builder_tx<DB>(
-        &self,
-        info: &mut ExecutionInfo,
-        db: &mut State<DB>,
-        builder_tx_gas: u64,
-        message: Vec<u8>,
-    ) -> Option<()>
-    where
-        DB: Database<Error = ProviderError>,
-    {
-        self.builder_signer()
-            .map(|signer| {
-                let base_fee = self.base_fee();
-                // Create message with block number for the builder to sign
-                let nonce = db
-                    .load_cache_account(signer.address)
-                    .map(|acc| acc.account_info().unwrap_or_default().nonce)
-                    .map_err(|_| {
-                        PayloadBuilderError::other(OpPayloadBuilderError::AccountLoadFailed(
-                            signer.address,
-                        ))
-                    })?;
-
-                // Create the EIP-1559 transaction
-                let eip1559 = OpTypedTransaction::Eip1559(TxEip1559 {
-                    chain_id: self.chain_id(),
-                    nonce,
-                    gas_limit: builder_tx_gas,
-                    max_fee_per_gas: base_fee.into(),
-                    max_priority_fee_per_gas: 0,
-                    to: TxKind::Call(Address::ZERO),
-                    // Include the message as part of the transaction data
-                    input: message.into(),
-                    ..Default::default()
-                });
-                let tx = eip1559;
-
-                // Sign the transaction
-                let builder_tx = signer.sign_tx(tx).map_err(PayloadBuilderError::other)?;
-
-                let mut tx_executor = self
-                    .executor
-                    .tx_executor(self.initialized_block_env.clone(), db);
-
-                let (_) = tx_executor.execute(&builder_tx).expect("todo errors");
-                // .map_err(PayloadBuilderError::EvmExecutionError)?;
-
-                // uncommitted.commit();
-                // Release the db reference by dropping evm
-                // NOTE(dshulyak) why it was necessary?
-                // drop(executor);
-                // info.add(executed.into());
-                Ok(())
-            })
-            .transpose()
-            .unwrap_or_else(|err: PayloadBuilderError| {
-                warn!(target: "payload_builder", %err, "Failed to add builder transaction");
-                None
-            })
-    }
-
-    fn estimate_gas_for_builder_tx(input: Vec<u8>) -> u64 {
-        // Count zero and non-zero bytes
-        let (zero_bytes, nonzero_bytes) = input.iter().fold((0, 0), |(zeros, nonzeros), &byte| {
-            if byte == 0 {
-                (zeros + 1, nonzeros)
-            } else {
-                (zeros, nonzeros + 1)
-            }
-        });
-
-        // Calculate gas cost (4 gas per zero byte, 16 gas per non-zero byte)
-        let zero_cost = zero_bytes * 4;
-        let nonzero_cost = nonzero_bytes * 16;
-
-        zero_cost + nonzero_cost + 21_000
-    }
+    zero_cost + nonzero_cost + 21_000
 }
