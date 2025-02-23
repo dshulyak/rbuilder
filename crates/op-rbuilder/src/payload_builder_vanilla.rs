@@ -3,7 +3,7 @@ use std::{fmt::Display, sync::Arc, time::Instant};
 
 use crate::generator::BuildArguments;
 use crate::tx_executor::{
-    OpExecutionResult, OpTxExecutor, StateAccess, TxExecutionInfo, TxExecutor,
+    OpExecutionResult, OpTxExecutor, OpTxExecutorError, StateAccess, TxExecutor, ConfigureEvm,
 };
 use crate::{
     generator::{BlockCell, PayloadBuilder},
@@ -11,22 +11,22 @@ use crate::{
     tx_signer::Signer,
 };
 
-use alloy_consensus::{Header, Transaction, TxEip1559, Typed2718, EMPTY_OMMER_ROOT_HASH};
+use alloy_consensus::{
+    transaction::Recovered, Header, Transaction, TxEip1559, Typed2718, EMPTY_OMMER_ROOT_HASH,
+};
 use alloy_eips::merge::BEACON_NONCE;
 use alloy_primitives::{Address, Bytes, TxKind, B256, U256};
 use alloy_rpc_types_engine::PayloadId;
 use alloy_rpc_types_eth::Withdrawals;
-use op_alloy_consensus::{EIP1559ParamError, OpTypedTransaction};
+use op_alloy_consensus::OpTypedTransaction;
 use reth::core::primitives::InMemorySize;
 use reth_basic_payload_builder::*;
 use reth_chain_state::ExecutedBlock;
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
-use reth_evm::ConfigureEvmEnv;
 use reth_evm::{env::EvmEnv, NextBlockEnvAttributes};
 use reth_execution_types::ExecutionOutcome;
 use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_consensus::calculate_receipt_root_no_memo_optimism;
-use reth_optimism_evm::OpEvmConfig;
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_payload_builder::{
     error::OpPayloadBuilderError,
@@ -56,9 +56,9 @@ use tracing::{info, trace, warn};
 
 /// Optimism's payload builder
 #[derive(Debug, Clone)]
-pub struct OpPayloadBuilderVanilla<Strategy, Txs = BestPoolTransactions> {
+pub struct OpPayloadBuilderVanilla<EvmConfig, Strategy, Txs = BestPoolTransactions> {
     /// The type responsible for creating the evm.
-    pub evm_config: OpEvmConfig,
+    pub evm_config: EvmConfig,
     /// The builder's signer key to use for an end of block tx
     pub builder_signer: Option<Signer>,
     /// The type responsible for yielding the best transactions for the payload if mempool
@@ -70,13 +70,9 @@ pub struct OpPayloadBuilderVanilla<Strategy, Txs = BestPoolTransactions> {
     pub strategy: Strategy,
 }
 
-impl<Strategy> OpPayloadBuilderVanilla<Strategy> {
+impl<EvmConfig, Strategy> OpPayloadBuilderVanilla<EvmConfig, Strategy> {
     /// `OpPayloadBuilder` constructor.
-    pub fn new(
-        evm_config: OpEvmConfig,
-        builder_signer: Option<Signer>,
-        strategy: Strategy,
-    ) -> Self {
+    pub fn new(evm_config: EvmConfig, builder_signer: Option<Signer>, strategy: Strategy) -> Self {
         Self {
             evm_config,
             builder_signer,
@@ -87,10 +83,12 @@ impl<Strategy> OpPayloadBuilderVanilla<Strategy> {
     }
 }
 
-impl<Strategy, Pool, Client> PayloadBuilder<Pool, Client> for OpPayloadBuilderVanilla<Strategy>
+impl<EvmConfig, Strategy, Pool, Client> PayloadBuilder<Pool, Client>
+    for OpPayloadBuilderVanilla<EvmConfig, Strategy>
 where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec = OpChainSpec>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = OpTransactionSigned>>,
+    EvmConfig: ConfigureEvm<Header = Header>,
     Strategy: OpBuilderStrategy + Clone + Send + Sync + 'static,
 {
     type Attributes = OpPayloadBuilderAttributes;
@@ -139,8 +137,9 @@ where
     }
 }
 
-impl<Strategy> OpPayloadBuilderVanilla<Strategy>
+impl<Strategy, EvmConfig> OpPayloadBuilderVanilla<EvmConfig, Strategy>
 where
+    EvmConfig: ConfigureEvm<Header = Header>,
     Strategy: OpBuilderStrategy,
 {
     /// Constructs an Optimism payload from the transactions sent via the
@@ -196,8 +195,10 @@ where
             let executor = OpTxExecutor::new(
                 ctx.initialized_block_env.clone(),
                 cfg_env_with_handler_cfg,
+                ctx.chain_spec.clone(),
                 &self.evm_config,
                 &mut state,
+                ctx.attributes().timestamp(),
             );
             strategy.execute(ctx, executor, best)
         } else {
@@ -209,8 +210,10 @@ where
             let executor = OpTxExecutor::new(
                 ctx.initialized_block_env.clone(),
                 cfg_env_with_handler_cfg,
+                ctx.chain_spec.clone(),
                 &self.evm_config,
                 &mut state,
+                ctx.attributes().timestamp(),
             );
             strategy.execute(ctx, executor, best)
         }
@@ -218,14 +221,17 @@ where
     }
 }
 
-impl<Txs> OpPayloadBuilderVanilla<Txs> {
+impl<EvmConfig, Txs> OpPayloadBuilderVanilla<EvmConfig, Txs>
+where
+    EvmConfig: ConfigureEvm<Header = Header>,
+{
     /// Returns the configured [`EvmEnv`] for the targeted payload
     /// (that has the `parent` as its parent).
     pub fn cfg_and_block_env(
         &self,
         attributes: &OpPayloadBuilderAttributes,
-        parent: &Header,
-    ) -> Result<EvmEnv, EIP1559ParamError> {
+        parent: &EvmConfig::Header,
+    ) -> Result<EvmEnv, EvmConfig::Error> {
         let next_attributes: NextBlockEnvAttributes = NextBlockEnvAttributes {
             timestamp: attributes.timestamp(),
             suggested_fee_recipient: attributes.suggested_fee_recipient(),
@@ -236,7 +242,6 @@ impl<Txs> OpPayloadBuilderVanilla<Txs> {
             .next_cfg_and_block_env(parent, next_attributes)
     }
 }
-
 
 #[macro_export]
 macro_rules! check {
@@ -299,8 +304,9 @@ pub trait OpBuilderStrategy {
         Executor: TxExecutor<
                 'a,
                 DB,
-                Transaction = OpTransactionSigned,
+                Transaction = Recovered<OpTransactionSigned>,
                 ExecutionResult = OpExecutionResult,
+                Error = OpTxExecutorError<DB::Error>,
             > + StateAccess<'a, DB>,
         TxsFn: FnOnce(BestTransactionsAttributes) -> Txs + Send + Sync + 'a,
         Txs: PayloadTransactions<Transaction = OpTransactionSigned>,
@@ -550,8 +556,9 @@ pub trait OpBuilderStrategy {
         Executor: TxExecutor<
             'a,
             DB,
-            Transaction = OpTransactionSigned,
+            Transaction = Recovered<OpTransactionSigned>,
             ExecutionResult = OpExecutionResult,
+            Error = OpTxExecutorError<DB::Error>,
         >,
     {
         let sequencer_tx_start_time = Instant::now();
@@ -576,22 +583,19 @@ pub trait OpBuilderStrategy {
                 .try_into_ecrecovered()
                 .map_err(|_| {
                     PayloadBuilderError::other(OpPayloadBuilderError::TransactionEcRecoverFailed)
-                })?;
-
-            executor.execute(&tx).map_or_else(|err| {
-                match err {
-                    EVMError::Transaction(err) => {
-                        trace!(target: "payload_builder", %err, ?tx, "Error in sequencer transaction, skipping.");
-                        Ok(())
-                    }
-                    err => {
-                        // this is an error that we should treat as fatal for this attempt
-                        Err(PayloadBuilderError::EvmExecutionError(err))
-                    }
+                })?
+                .into();
+            match executor.execute(&tx) {
+                Ok(rst) => {
+                    info.add(tx, rst, 0);
                 }
-            },|rst| {
-                Ok(())
-            })?;
+                Err(OpTxExecutorError::EVMError(EVMError::Transaction(err))) => {
+                    trace!(target: "payload_builder", %err, ?tx, "Error in sequencer transaction, skipping.");
+                }
+                err => {
+                    err?;
+                }
+            }
         }
         ctx.metrics
             .sequencer_tx_duration
@@ -617,8 +621,9 @@ pub trait OpBuilderStrategy {
         Executor: TxExecutor<
             'a,
             DB,
-            Transaction = OpTransactionSigned,
+            Transaction = Recovered<OpTransactionSigned>,
             ExecutionResult = OpExecutionResult,
+            Error = OpTxExecutorError<DB::Error>,
         >,
     {
         let best_txs_start_time = Instant::now();
@@ -655,7 +660,7 @@ pub trait OpBuilderStrategy {
             );
 
             let tx_simulation_start_time = Instant::now();
-
+            let tx = tx.into();
             match executor.transact(&tx) {
                 Ok((result, state)) => {
                     ctx.metrics
@@ -679,27 +684,20 @@ pub trait OpBuilderStrategy {
                         .record(num_txs_simulated_fail as f64);
 
                     executor.commit(state);
-                    let receipt = result.receipt();
-                    // info.add(executed.into());
+                    info.add(tx.into(), result, base_fee);
                 }
-                Err(err) => {
-                    match err {
-                        EVMError::Transaction(err) => {
-                            if matches!(err, InvalidTransaction::NonceTooLow { .. }) {
-                                // if the nonce is too low, we can skip this transaction
-                                trace!(target: "payload_builder", %err, ?tx, "skipping nonce too low transaction");
-                            } else {
-                                // if the transaction is invalid, we can skip it and all of its
-                                // descendants
-                                trace!(target: "payload_builder", %err, ?tx, "skipping invalid transaction and its descendants");
-                                best_txs.mark_invalid(tx.signer(), tx.nonce());
-                            }
-                        }
-                        err => {
-                            // this is an error that we should treat as fatal for this attempt
-                            return Err(PayloadBuilderError::EvmExecutionError(err));
-                        }
+                Err(OpTxExecutorError::EVMError(EVMError::Transaction(err))) => {
+                    if matches!(err, InvalidTransaction::NonceTooLow { .. }) {
+                        // if the nonce is too low, we can skip this transaction
+                        trace!(target: "payload_builder", %err, ?tx, "skipping nonce too low transaction");
+                    } else {
+                        // if the transaction is invalid, we can skip it and all of its descendants
+                        trace!(target: "payload_builder", %err, ?tx, "skipping invalid transaction and its descendants");
+                        best_txs.mark_invalid(tx.signer(), tx.nonce());
                     }
+                }
+                err => {
+                    err?;
                 }
             };
         }
@@ -727,8 +725,9 @@ pub trait OpBuilderStrategy {
         Executor: TxExecutor<
                 'a,
                 DB,
-                Transaction = OpTransactionSigned,
+                Transaction = Recovered<OpTransactionSigned>,
                 ExecutionResult = OpExecutionResult,
+                Error = OpTxExecutorError<DB::Error>,
             > + StateAccess<'a, DB>,
     {
         ctx.builder_signer()
@@ -761,16 +760,15 @@ pub trait OpBuilderStrategy {
                 // Sign the transaction
                 let builder_tx = signer
                     .sign_tx(eip1559)
-                    .map_err(PayloadBuilderError::other)?;
+                    .map_err(PayloadBuilderError::other)?
+                    .into();
 
-                let receipt = executor
-                    .execute(&builder_tx)
-                    .map_err(PayloadBuilderError::EvmExecutionError)?;
-
+                let result = executor.execute(&builder_tx)?;
+                // note that base_fee is zero
+                info.add(builder_tx, result, 0);
                 // Release the db reference by dropping evm
                 // NOTE(dshulyak) why it was necessary?
                 // drop(executor);
-                // info.add(executed.into());
                 Ok(())
             })
             .transpose()
@@ -785,11 +783,6 @@ pub trait OpBuilderStrategy {
 pub struct DefaultOpBuilderStrategy;
 
 impl OpBuilderStrategy for DefaultOpBuilderStrategy {}
-
-#[derive(Debug, Clone)]
-pub struct FlashblocksBuilderStrategy;
-
-impl OpBuilderStrategy for FlashblocksBuilderStrategy {}
 
 /// A type that returns a the [`PayloadTransactions`] that should be included in the pool.
 pub trait OpPayloadTransactions: Clone + Send + Sync + Unpin + 'static {
@@ -847,12 +840,20 @@ impl ExecutionInfo {
         }
     }
 
-    pub fn add(&mut self, info: TxExecutionInfo) {
-        self.executed_transactions.push(info.tx);
-        self.executed_senders.push(info.sender);
-        self.receipts.push(info.receipt);
-        self.cumulative_gas_used += info.gas_used;
-        self.total_fees += info.fee;
+    pub fn add(
+        &mut self,
+        tx: Recovered<OpTransactionSigned>,
+        result: OpExecutionResult,
+        base_fee: u64,
+    ) {
+        self.executed_senders.push(tx.signer());
+        self.cumulative_gas_used += result.gas_used();
+        let miner_fee = tx
+            .effective_tip_per_gas(base_fee)
+            .expect("fee is always valid; execution succeeded");
+        self.total_fees += U256::from(miner_fee) * U256::from(result.gas_used());
+        self.executed_transactions.push(tx.into_tx());
+        self.receipts.push(result.receipt());
     }
 }
 
@@ -956,22 +957,10 @@ impl OpPayloadBuilderCtx {
         self.attributes().payload_id()
     }
 
-    /// Returns true if regolith is active for the payload.
-    pub fn is_regolith_active(&self) -> bool {
-        self.chain_spec
-            .is_regolith_active_at_timestamp(self.attributes().timestamp())
-    }
-
     /// Returns true if ecotone is active for the payload.
     pub fn is_ecotone_active(&self) -> bool {
         self.chain_spec
             .is_ecotone_active_at_timestamp(self.attributes().timestamp())
-    }
-
-    /// Returns true if canyon is active for the payload.
-    pub fn is_canyon_active(&self) -> bool {
-        self.chain_spec
-            .is_canyon_active_at_timestamp(self.attributes().timestamp())
     }
 
     /// Returns true if holocene is active for the payload.

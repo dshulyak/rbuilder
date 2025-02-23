@@ -6566,6 +6566,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "thiserror 1.0.69",
  "tikv-jemallocator",
  "time",
  "tokio",

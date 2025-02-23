@@ -1,7 +1,7 @@
 use std::{fmt::Display, sync::Arc, sync::Mutex};
 
 use crate::generator::{BlockCell, BuildArguments, PayloadBuilder};
-use crate::tx_executor::{Executor, TxExecutionInfo};
+use crate::tx_executor::{Executor, TxExecutionInfo, ConfigureEvm};
 
 use alloy_consensus::{Header, Transaction, Typed2718, EMPTY_OMMER_ROOT_HASH};
 use alloy_eips::merge::BEACON_NONCE;
@@ -9,7 +9,7 @@ use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_rpc_types_engine::PayloadId;
 use reth_basic_payload_builder::*;
 use reth_chainspec::ChainSpecProvider;
-use reth_evm::{env::EvmEnv, system_calls::SystemCaller, ConfigureEvm, NextBlockEnvAttributes};
+use reth_evm::{env::EvmEnv, system_calls::SystemCaller, NextBlockEnvAttributes};
 use reth_execution_types::ExecutionOutcome;
 use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_consensus::calculate_receipt_root_no_memo_optimism;
@@ -30,11 +30,11 @@ use reth_transaction_pool::PoolTransaction;
 use reth_transaction_pool::{BestTransactionsAttributes, TransactionPool};
 use revm::{
     db::{states::bundle_state::BundleRetention, BundleState, State},
-    primitives::{BlockEnv, CfgEnvWithHandlerCfg, InvalidTransaction},
+    primitives::{BlockEnv, CfgEnvWithHandlerCfg},
     Database, DatabaseCommit,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 use op_alloy_rpc_types_engine::OpExecutionPayloadEnvelopeV3;
 use reth_optimism_payload_builder::error::OpPayloadBuilderError;
@@ -740,14 +740,14 @@ where
             // Convert the transaction to a [TransactionSignedEcRecovered]. This is
             // purely for the purposes of utilizing the `evm_config.tx_env`` function.
             // Deposit transactions do not have signatures, so if the tx is a deposit, this
-                // will just pull in its `from` address.
-                let tx = sequencer_tx
-                    .value()
-                    .clone()
-                    .try_into_ecrecovered()
-                    .map_err(|_| {
-                        PayloadBuilderError::other(OpPayloadBuilderError::TransactionEcRecoverFailed)
-                    })?;
+            // will just pull in its `from` address.
+            let tx = sequencer_tx
+                .value()
+                .clone()
+                .try_into_ecrecovered()
+                .map_err(|_| {
+                    PayloadBuilderError::other(OpPayloadBuilderError::TransactionEcRecoverFailed)
+                })?;
 
             executor.execute(tx).map_or_else(
                 |err| {
