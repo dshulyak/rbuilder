@@ -190,7 +190,7 @@ fn estimate_gas_for_builder_tx(input: impl AsRef<[u8]>) -> u64 {
 
 /// Returns the configured [`EvmEnv`] for the targeted payload
 /// (that has the `parent` as its parent).
-fn cfg_and_block_env<EvmConfig>(
+pub fn cfg_and_block_env<EvmConfig>(
     evm_config: &EvmConfig,
     attributes: &OpPayloadBuilderAttributes,
     parent: &EvmConfig::Header,

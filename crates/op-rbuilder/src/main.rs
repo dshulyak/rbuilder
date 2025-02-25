@@ -1,7 +1,7 @@
 use clap::Parser;
 use generator::CustomOpPayloadBuilder;
 use monitoring::Monitoring;
-use payload_builder_vanilla::{VanillaOpBuilderStrategy, OpPayloadBuilderVanilla};
+use builder_vanilla::{VanillaOpBuilderStrategy, OpPayloadBuilderVanilla};
 use reth::builder::Node;
 use reth::providers::CanonStateSubscriptions;
 use reth::{
@@ -22,7 +22,7 @@ pub mod generator;
 mod integration;
 mod metrics;
 mod monitoring;
-pub mod payload_builder;
+pub mod builder_flashblocks;
 pub mod actions_pre_block;
 pub mod actions_builder_tx;
 pub mod actions_tx_executor;
@@ -30,7 +30,7 @@ pub mod actions_payload;
 pub mod payload_context;
 pub mod payload_transactions;
 pub mod execution_info;
-mod payload_builder_vanilla;
+mod builder_vanilla;
 #[cfg(test)]
 mod tester;
 mod tx_executor;
