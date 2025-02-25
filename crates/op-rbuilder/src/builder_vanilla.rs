@@ -24,13 +24,13 @@ use crate::actions::builder_tx::DefaultBuilderTxActions;
 use crate::actions::payload::OpCreatePayloadAction;
 use crate::actions::pre_block::{OpPreBlockActions, PreBlockRootContractSyscall};
 use crate::actions::tx_executor::OpTransactionsActions;
-use crate::generator::BuildArguments;
 use crate::components::payload_context::OpPayloadBuilderCtx;
 use crate::components::payload_transactions::{BestPoolTransactions, OpPayloadTransactions};
 use crate::components::tx_executor::{
     ConfigureEvm, Database, OpExecutionResult, OpTxExecutor, OpTxExecutorError, StateAccess,
     TxExecutor,
 };
+use crate::generator::BuildArguments;
 use crate::{check, impl_traits};
 use crate::{
     generator::{BlockCell, PayloadBuilder},
@@ -73,7 +73,7 @@ where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec = OpChainSpec>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = OpTransactionSigned>>,
     EvmConfig: ConfigureEvm<Header = Header>,
-    Strategy: DefaultOpBuilderStrategy + Clone + Send + Sync + 'static,
+    Strategy: VanillaStrategy + Clone + Send + Sync + 'static,
 {
     type Attributes = OpPayloadBuilderAttributes;
     type BuiltPayload = OpBuiltPayload;
@@ -109,9 +109,17 @@ where
 ///
 /// And finally
 /// 5. build the block: compute all roots (txs, state)
-pub trait DefaultOpBuilderStrategy:
+pub trait VanillaStrategy:
     OpPreBlockActions + DefaultBuilderTxActions + OpTransactionsActions + OpCreatePayloadAction
 {
+    /// Constructs an Optimism payload from the transactions sent via the
+    /// Payload attributes by the sequencer. If the `no_tx_pool` argument is passed in
+    /// the payload attributes, the transaction pool will be ignored and the only transactions
+    /// included in the payload will be those sent through the attributes.
+    ///
+    /// Given build arguments including an Optimism client, transaction pool,
+    /// and configuration, this function creates a transaction payload. Returns
+    /// a result indicating success with the payload or an error in case of failure.
     fn build<'a, Pool, Client, EvmConfig, Txs>(
         &self,
         args: BuildArguments<Pool, Client, OpPayloadBuilderAttributes>,
@@ -219,7 +227,7 @@ where
     Pool: TransactionPool,
     Txs: PayloadTransactions<Transaction = OpTransactionSigned>,
     EvmConfig: ConfigureEvm<Header = Header>,
-    Strategy: DefaultOpBuilderStrategy + ?Sized,
+    Strategy: VanillaStrategy + ?Sized,
 {
     let evm_env = cfg_and_block_env(
         evm_config,
@@ -283,14 +291,6 @@ where
     .map(|out| out.with_cached_reads(cached_reads))
 }
 
-/// Constructs an Optimism payload from the transactions sent via the
-/// Payload attributes by the sequencer. If the `no_tx_pool` argument is passed in
-/// the payload attributes, the transaction pool will be ignored and the only transactions
-/// included in the payload will be those sent through the attributes.
-///
-/// Given build arguments including an Optimism client, transaction pool,
-/// and configuration, this function creates a transaction payload. Returns
-/// a result indicating success with the payload or an error in case of failure.
 fn execute<'a, Strategy, Executor, DB, P, Txs, TxsFn>(
     strategy: &'a Strategy,
     ctx: OpPayloadBuilderCtx,
@@ -298,7 +298,7 @@ fn execute<'a, Strategy, Executor, DB, P, Txs, TxsFn>(
     best: TxsFn,
 ) -> Result<BuildOutcomeKind<OpBuiltPayload>, PayloadBuilderError>
 where
-    Strategy: DefaultOpBuilderStrategy + ?Sized,
+    Strategy: VanillaStrategy + ?Sized,
     Executor: TxExecutor<
             'a,
             DB,
@@ -354,13 +354,13 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub struct VanillaOpBuilderStrategy;
+pub struct DefaultVanillaStrategy;
 
 impl_traits!(
-    VanillaOpBuilderStrategy,
+    DefaultVanillaStrategy,
     OpPreBlockActions,
     OpTransactionsActions,
     OpCreatePayloadAction,
     DefaultBuilderTxActions,
-    DefaultOpBuilderStrategy
+    VanillaStrategy
 );

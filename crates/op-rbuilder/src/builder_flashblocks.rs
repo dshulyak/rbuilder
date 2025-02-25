@@ -37,6 +37,7 @@ use crate::components::payload_context::OpPayloadBuilderCtx;
 use crate::components::payload_transactions::{BestPoolTransactions, OpPayloadTransactions};
 use crate::components::tx_executor::{ConfigureEvm, Database, OpTxExecutor, StateAccess};
 use crate::generator::{BlockCell, BuildArguments, PayloadBuilder};
+use crate::impl_traits;
 
 /// Optimism's payload builder
 #[derive(Debug, Clone)]
@@ -130,7 +131,7 @@ where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec = OpChainSpec>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = EvmConfig::Transaction>>,
     EvmConfig: ConfigureEvm<Header = Header, Transaction = OpTransactionSigned>,
-    Strategy: FlashblocksBuilderStrategy + Clone + Send + Sync + 'static,
+    Strategy: FlashblocksStrategy + Clone + Send + Sync + 'static,
 {
     type Attributes = OpPayloadBuilderAttributes;
     type BuiltPayload = OpBuiltPayload;
@@ -150,7 +151,7 @@ where
     }
 }
 
-trait FlashblocksBuilderStrategy: OpPreBlockActions + OpTransactionsActions {
+trait FlashblocksStrategy: OpPreBlockActions + OpTransactionsActions {
     /// Constructs an Optimism payload from the transactions sent via the
     /// Payload attributes by the sequencer. If the `no_tx_pool` argument is passed in
     /// the payload attributes, the transaction pool will be ignored and the only transactions
@@ -453,3 +454,14 @@ pub struct ExecutedPayload {
     /// Withdrawal hash.
     pub withdrawals_root: Option<B256>,
 }
+
+
+#[derive(Debug, Clone)]
+pub struct DefaultFlashblocksBuilder{}
+
+impl_traits!(
+    DefaultFlashblocksBuilder,
+    OpPreBlockActions,
+    OpTransactionsActions,
+    FlashblocksStrategy
+);
