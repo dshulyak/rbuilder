@@ -15,9 +15,8 @@ use reth_provider::{ExecutionOutcome, HashedPostStateProvider, ProviderError, St
 use revm::{db::states::bundle_state::BundleRetention, State};
 use tracing::{info, warn};
 
-use crate::{
-    execution_info::ExecutionInfo, payload_context::OpPayloadBuilderCtx,
-    tx_executor::Database,
+use crate::components::{
+    execution_info::ExecutionInfo, payload_context::OpPayloadBuilderCtx, tx_executor::Database,
 };
 
 pub trait OpCreatePayloadAction {

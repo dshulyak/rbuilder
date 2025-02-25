@@ -4,7 +4,7 @@ use alloy_consensus::{transaction::Recovered, Transaction};
 use alloy_primitives::{Address, U256};
 use reth_optimism_primitives::{OpReceipt, OpTransactionSigned};
 
-use crate::tx_executor::OpExecutionResult;
+use crate::components::tx_executor::OpExecutionResult;
 
 
 /// This acts as the container for executed transactions and its byproducts (receipts, gas used)

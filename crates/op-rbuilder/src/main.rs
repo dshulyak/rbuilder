@@ -23,18 +23,12 @@ mod integration;
 mod metrics;
 mod monitoring;
 pub mod builder_flashblocks;
-pub mod actions_pre_block;
-pub mod actions_builder_tx;
-pub mod actions_tx_executor;
-pub mod actions_payload;
-pub mod payload_context;
-pub mod payload_transactions;
-pub mod execution_info;
 mod builder_vanilla;
+pub mod actions;
+pub mod components;
+pub mod tx_signer;
 #[cfg(test)]
 mod tester;
-mod tx_executor;
-mod tx_signer;
 
 fn main() {
     Cli::<OpChainSpecParser, args::OpRbuilderArgs>::parse()

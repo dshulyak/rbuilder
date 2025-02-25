@@ -1,17 +1,10 @@
 use std::{sync::Arc, sync::Mutex};
 
-use crate::actions_pre_block::OpPreBlockActions;
-use crate::actions_tx_executor::OpTransactionsActions;
-use crate::builder_vanilla::cfg_and_block_env;
-use crate::execution_info::ExecutionInfo;
-use crate::generator::{BlockCell, BuildArguments, PayloadBuilder};
-use crate::payload_context::OpPayloadBuilderCtx;
-use crate::payload_transactions::{BestPoolTransactions, OpPayloadTransactions};
-use crate::tx_executor::{ConfigureEvm, Database, OpTxExecutor, StateAccess};
-
 use alloy_consensus::{Header, EMPTY_OMMER_ROOT_HASH};
 use alloy_eips::merge::BEACON_NONCE;
 use alloy_primitives::{B256, U256};
+use futures_util::FutureExt;
+use futures_util::SinkExt;
 use op_alloy_rpc_types_engine::OpExecutionPayloadEnvelopeV3;
 use reth_chainspec::ChainSpecProvider;
 use reth_evm::env::EvmEnv;
@@ -30,14 +23,20 @@ use reth_revm::database::StateProviderDatabase;
 use reth_transaction_pool::PoolTransaction;
 use reth_transaction_pool::TransactionPool;
 use revm::db::{states::bundle_state::BundleRetention, BundleState, State};
-use tracing::{debug, warn};
-
-use futures_util::FutureExt;
-use futures_util::SinkExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::WebSocketStream;
+use tracing::{debug, warn};
+
+use crate::actions::pre_block::OpPreBlockActions;
+use crate::actions::tx_executor::OpTransactionsActions;
+use crate::builder_vanilla::cfg_and_block_env;
+use crate::components::execution_info::ExecutionInfo;
+use crate::components::payload_context::OpPayloadBuilderCtx;
+use crate::components::payload_transactions::{BestPoolTransactions, OpPayloadTransactions};
+use crate::components::tx_executor::{ConfigureEvm, Database, OpTxExecutor, StateAccess};
+use crate::generator::{BlockCell, BuildArguments, PayloadBuilder};
 
 /// Optimism's payload builder
 #[derive(Debug, Clone)]
@@ -124,7 +123,6 @@ impl<Strategy, EvmConfig> OpPayloadBuilder<Strategy, EvmConfig> {
         });
     }
 }
-
 
 impl<Strategy, EvmConfig, Pool, Client> PayloadBuilder<Pool, Client>
     for OpPayloadBuilder<Strategy, EvmConfig>

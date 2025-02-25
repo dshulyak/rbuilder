@@ -20,7 +20,8 @@ use revm::{
     Database as RevmDatabase, DatabaseCommit, Evm, State,
 };
 
-use crate::actions_pre_block::PreBlockRootContractSyscall;
+// this trait should not be imported here
+use crate::actions::pre_block::PreBlockRootContractSyscall;
 
 // aliases give an option to fix the breaking change in the contract
 // sort of a delay, if trait/type becomes unstable change can be made

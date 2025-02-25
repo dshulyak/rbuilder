@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use crate::tx_executor::{BlockEnv, Database};
+use crate::components::tx_executor::{BlockEnv, Database};
 use crate::{metrics::OpRBuilderMetrics, tx_signer::Signer};
 
 use alloy_primitives::{Bytes, B256};

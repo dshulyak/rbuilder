@@ -1,10 +1,5 @@
 use std::time::Instant;
 
-use crate::execution_info::ExecutionInfo;
-use crate::payload_context::OpPayloadBuilderCtx;
-use crate::tx_executor::{Database, OpExecutionResult, OpTxExecutorError, TxExecutor};
-use crate::{check, skip};
-
 use alloy_consensus::{transaction::Recovered, Transaction, Typed2718};
 use reth::core::primitives::InMemorySize;
 use reth_optimism_payload_builder::error::OpPayloadBuilderError;
@@ -17,6 +12,13 @@ use reth_provider::ProviderError;
 use reth_transaction_pool::BestTransactionsAttributes;
 use revm::primitives::{EVMError, InvalidTransaction};
 use tracing::trace;
+
+use crate::components::{
+    execution_info::ExecutionInfo,
+    payload_context::OpPayloadBuilderCtx,
+    tx_executor::{Database, OpExecutionResult, OpTxExecutorError, TxExecutor},
+};
+use crate::{check, skip};
 
 pub trait OpTransactionsActions {
     /// Executes all sequencer transactions that are included in the payload attributes.

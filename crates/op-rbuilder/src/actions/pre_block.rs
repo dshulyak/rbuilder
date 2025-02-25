@@ -10,8 +10,7 @@ use reth_optimism_payload_builder::error::OpPayloadBuilderError;
 use revm::{Database, State};
 use tracing::warn;
 
-use crate::payload_context::OpPayloadBuilderCtx;
-use crate::tx_executor::StateAccess;
+use crate::components::{payload_context::OpPayloadBuilderCtx, tx_executor::StateAccess};
 
 /// Ensures that the CREATE2 deployer exists in the state.
 ///

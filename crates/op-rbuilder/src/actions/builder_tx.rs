@@ -7,9 +7,9 @@ use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_provider::ProviderError;
 use tracing::warn;
 
-use crate::execution_info::ExecutionInfo;
-use crate::payload_context::OpPayloadBuilderCtx;
-use crate::tx_executor::{Database, OpExecutionResult, OpTxExecutorError, StateAccess, TxExecutor};
+use crate::components::execution_info::ExecutionInfo;
+use crate::components::payload_context::OpPayloadBuilderCtx;
+use crate::components::tx_executor::{Database, OpExecutionResult, OpTxExecutorError, StateAccess, TxExecutor};
 
 
 /// Trait for handling builder transaction related functionality

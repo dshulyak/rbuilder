@@ -20,14 +20,14 @@ use reth_transaction_pool::{BestTransactionsAttributes, TransactionPool};
 use revm::State;
 use tracing::info;
 
-use crate::actions_builder_tx::DefaultBuilderTxActions;
-use crate::actions_payload::OpCreatePayloadAction;
-use crate::actions_pre_block::{OpPreBlockActions, PreBlockRootContractSyscall};
-use crate::actions_tx_executor::OpTransactionsActions;
+use crate::actions::builder_tx::DefaultBuilderTxActions;
+use crate::actions::payload::OpCreatePayloadAction;
+use crate::actions::pre_block::{OpPreBlockActions, PreBlockRootContractSyscall};
+use crate::actions::tx_executor::OpTransactionsActions;
 use crate::generator::BuildArguments;
-use crate::payload_context::OpPayloadBuilderCtx;
-use crate::payload_transactions::{BestPoolTransactions, OpPayloadTransactions};
-use crate::tx_executor::{
+use crate::components::payload_context::OpPayloadBuilderCtx;
+use crate::components::payload_transactions::{BestPoolTransactions, OpPayloadTransactions};
+use crate::components::tx_executor::{
     ConfigureEvm, Database, OpExecutionResult, OpTxExecutor, OpTxExecutorError, StateAccess,
     TxExecutor,
 };
