@@ -20,6 +20,40 @@ use crate::components::{
 };
 use crate::{check, skip};
 
+
+pub trait Tx {
+    fn execute(&self);
+}
+
+pub trait NonDefaultExecution<T: Tx> {
+    fn execute_first(&self, tx: T) {
+        tx.execute();
+    }
+
+    fn execute_second(&self, tx: T) {
+        tx.execute();
+    }
+}
+
+struct NonDefaultImpl {}
+
+struct MyTx {
+    data: String,
+}
+
+impl Tx for MyTx {
+    fn execute(&self) {
+        println!("Executing transaction with data: {}", self.data);
+    }
+}
+
+impl NonDefaultExecution<MyTx> for NonDefaultImpl {
+    fn execute_first(&self, tx: MyTx) {
+        println!("Executing first transaction");
+        tx.execute();
+    }   
+}
+
 pub trait OpTransactionsActions {
     /// Executes all sequencer transactions that are included in the payload attributes.
     fn execute_sequencer_transactions<'a, Executor, DB>(

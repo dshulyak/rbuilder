@@ -37,7 +37,6 @@ pub trait PreBlockRootContractSyscall {
     ) -> Result<(), BlockExecutionError>;
 }
 
-/// Trait for handling pre-block actions in payload building
 pub trait OpPreBlockActions {
     /// Apply eip-4788 pre block contract call
     /// and
@@ -46,6 +45,19 @@ pub trait OpPreBlockActions {
     /// so we can safely assume that this will always be triggered upon the transition and that
     /// the above check for empty blocks will never be hit on OP chains.
     fn pre_block_actions<'a, Executor, DB>(
+        &self,
+        ctx: &OpPayloadBuilderCtx,
+        executor: &mut Executor,
+    ) -> Result<(), PayloadBuilderError>
+    where
+        Executor: StateAccess<'a, DB> + PreBlockRootContractSyscall,
+        DB: Database,
+        DB::Error: Display;
+}
+
+/// Trait for handling pre-block actions in payload building
+pub trait OpPreBlockActionsV1 {
+    fn pre_block_actions_v1<'a, Executor, DB>(
         &self,
         ctx: &OpPayloadBuilderCtx,
         executor: &mut Executor,
@@ -73,5 +85,20 @@ pub trait OpPreBlockActions {
             executor.db_mut(),
         )?;
         Ok(())
+    }
+}
+
+impl<T: OpPreBlockActionsV1> OpPreBlockActions for T {
+    fn pre_block_actions<'a, Executor, DB>(
+        &self,
+        ctx: &OpPayloadBuilderCtx,
+        executor: &mut Executor,
+    ) -> Result<(), PayloadBuilderError>
+    where
+        Executor: StateAccess<'a, DB> + PreBlockRootContractSyscall,
+        DB: Database,
+        DB::Error: Display,
+    {
+        self.pre_block_actions_v1(ctx, executor)
     }
 }

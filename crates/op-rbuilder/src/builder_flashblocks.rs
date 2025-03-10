@@ -30,6 +30,7 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, warn};
 
 use crate::actions::pre_block::OpPreBlockActions;
+use crate::actions::pre_block::OpPreBlockActionsV1;
 use crate::actions::tx_executor::OpTransactionsActions;
 use crate::builder_vanilla::cfg_and_block_env;
 use crate::components::execution_info::ExecutionInfo;
@@ -461,7 +462,7 @@ pub struct DefaultFlashblocksBuilder{}
 
 impl_traits!(
     DefaultFlashblocksBuilder,
-    OpPreBlockActions,
+    OpPreBlockActionsV1,
     OpTransactionsActions,
     FlashblocksStrategy
 );

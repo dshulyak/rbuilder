@@ -22,7 +22,7 @@ use tracing::info;
 
 use crate::actions::builder_tx::DefaultBuilderTxActions;
 use crate::actions::payload::OpCreatePayloadAction;
-use crate::actions::pre_block::{OpPreBlockActions, PreBlockRootContractSyscall};
+use crate::actions::pre_block::{OpPreBlockActions, OpPreBlockActionsV1, PreBlockRootContractSyscall};
 use crate::actions::tx_executor::OpTransactionsActions;
 use crate::components::payload_context::OpPayloadBuilderCtx;
 use crate::components::payload_transactions::{BestPoolTransactions, OpPayloadTransactions};
@@ -358,7 +358,7 @@ pub struct DefaultVanillaStrategy;
 
 impl_traits!(
     DefaultVanillaStrategy,
-    OpPreBlockActions,
+    OpPreBlockActionsV1,
     OpTransactionsActions,
     OpCreatePayloadAction,
     DefaultBuilderTxActions,
